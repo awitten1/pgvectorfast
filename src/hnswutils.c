@@ -20,6 +20,7 @@ extern Datum vector_l2_squared_distance(PG_FUNCTION_ARGS);
 #include "utils/memdebug.h"
 #include "utils/rel.h"
 #include "vector.h"
+#include "vector_simd.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -558,27 +559,11 @@ HnswOptimisticItem(Page page, OffsetNumber offno, Size minimum)
     return page + offset;
 }
 
-static float
-VectorL2SquaredDistance(int dim, float *ax, float *bx)
-{
-	float		distance = 0.0;
-
-	/* Auto-vectorized */
-	for (int i = 0; i < dim; i++)
-	{
-		float		diff = ax[i] - bx[i];
-
-		distance += diff * diff;
-	}
-
-	return distance;
-}
-
 /*
  * Calculate L2 squared distance optimistically - assumes 'a' is stable but 'b' may be modified
  * Directly computes distance without copying by validating varlena header first
  */
-__attribute__((target_clones("default", "fma"))) static inline bool
+static inline bool
 HnswGetDistanceOptimistic(const Vector *a_vec, const Vector *b_ptr, Size vec_size, double *distance_out)
 {
 	uint32		vl_len = __atomic_load_n((const uint32 *) &b_ptr->vl_len_, __ATOMIC_RELAXED);
@@ -588,7 +573,7 @@ HnswGetDistanceOptimistic(const Vector *a_vec, const Vector *b_ptr, Size vec_siz
 				 (vl_len >> 2) != (uint32) vec_size || (vl_len & 0x03) != 0))
 		return false;
 
-	*distance_out = (double) VectorL2SquaredDistance(b_dim, (float *) a_vec->x, (float *) b_ptr->x);
+	*distance_out = (double) VectorL2SquaredDistance(b_dim, a_vec->x, b_ptr->x);
 	return true;
 }
 

@@ -22,6 +22,7 @@
 #include "utils/lsyscache.h"
 #include "utils/varbit.h"
 #include "vector.h"
+#include "vector_simd.h"
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -61,6 +62,7 @@ _PG_init(void)
 {
 	CalicoInit();
 	BitvecInit();
+	VectorInit();
 	HalfvecInit();
 	HnswInit();
 	IvfflatInit();
@@ -558,20 +560,129 @@ halfvec_to_vector(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-VECTOR_TARGET_CLONES static float
-VectorL2SquaredDistance(int dim, float *ax, float *bx)
-{
-	float		distance = 0.0;
+#if !defined(VECTOR_NATIVE_AVX_FMA) && defined(USE_DISPATCH)
+#if defined(USE__GET_CPUID)
+#include <cpuid.h>
+#else
+#include <intrin.h>
+#endif
 
-	/* Auto-vectorized */
+#ifdef _MSC_VER
+#define TARGET_AVX_FMA
+#define TARGET_VECTOR_XSAVE
+#else
+#define TARGET_AVX_FMA __attribute__((target("avx,fma")))
+#define TARGET_VECTOR_XSAVE __attribute__((target("xsave")))
+#endif
+
+#define VEC_CPU_FEATURE_FMA     (1 << 12)
+#define VEC_CPU_FEATURE_OSXSAVE (1 << 27)
+#define VEC_CPU_FEATURE_AVX     (1 << 28)
+
+static float
+VectorL2SquaredDistanceDefault(int dim, const float *ax, const float *bx)
+{
+	return VectorL2SquaredDistanceScalar(dim, ax, bx);
+}
+
+TARGET_AVX_FMA static float
+VectorL2SquaredDistanceAvxFma(int dim, const float *ax, const float *bx)
+{
+	VECTOR_L2_SQUARED_AVX_FMA_IMPL(dim, ax, bx);
+}
+
+static float
+VectorInnerProductDefault(int dim, const float *ax, const float *bx)
+{
+	float		s0 = 0.0f;
+	float		s1 = 0.0f;
+	float		s2 = 0.0f;
+	float		s3 = 0.0f;
+	int			i = 0;
+
+	for (; i + 4 <= dim; i += 4)
+	{
+		s0 += ax[i] * bx[i];
+		s1 += ax[i + 1] * bx[i + 1];
+		s2 += ax[i + 2] * bx[i + 2];
+		s3 += ax[i + 3] * bx[i + 3];
+	}
+	for (; i < dim; i++)
+		s0 += ax[i] * bx[i];
+
+	return (s0 + s1) + (s2 + s3);
+}
+
+TARGET_AVX_FMA static float
+VectorInnerProductAvxFma(int dim, const float *ax, const float *bx)
+{
+	VECTOR_INNER_PRODUCT_AVX_FMA_IMPL(dim, ax, bx);
+}
+
+static double
+VectorCosineSimilarityDefault(int dim, const float *ax, const float *bx)
+{
+	float		similarity = 0.0f;
+	float		norma = 0.0f;
+	float		normb = 0.0f;
+
 	for (int i = 0; i < dim; i++)
 	{
-		float		diff = ax[i] - bx[i];
-
-		distance += diff * diff;
+		similarity += ax[i] * bx[i];
+		norma += ax[i] * ax[i];
+		normb += bx[i] * bx[i];
 	}
 
-	return distance;
+	return (double) similarity / sqrt((double) norma * (double) normb);
+}
+
+TARGET_AVX_FMA static double
+VectorCosineSimilarityAvxFma(int dim, const float *ax, const float *bx)
+{
+	VECTOR_COSINE_AVX_FMA_IMPL(dim, ax, bx);
+}
+
+float		(*VectorL2SquaredDistancePtr) (int dim, const float *ax, const float *bx) = VectorL2SquaredDistanceDefault;
+float		(*VectorInnerProductPtr) (int dim, const float *ax, const float *bx) = VectorInnerProductDefault;
+double		(*VectorCosineSimilarityPtr) (int dim, const float *ax, const float *bx) = VectorCosineSimilarityDefault;
+
+TARGET_VECTOR_XSAVE static bool
+VectorSupportsAvxFma(void)
+{
+	unsigned int exx[4] = {0, 0, 0, 0};
+	unsigned int need = VEC_CPU_FEATURE_AVX | VEC_CPU_FEATURE_FMA;
+
+#if defined(USE__GET_CPUID)
+	__get_cpuid(1, &exx[0], &exx[1], &exx[2], &exx[3]);
+#else
+	__cpuid(exx, 1);
+#endif
+
+	if ((exx[2] & VEC_CPU_FEATURE_OSXSAVE) != VEC_CPU_FEATURE_OSXSAVE)
+		return false;
+
+	if ((_xgetbv(0) & 6) != 6)
+		return false;
+
+	return (exx[2] & need) == need;
+}
+#endif
+
+void
+VectorInit(void)
+{
+#if !defined(VECTOR_NATIVE_AVX_FMA) && defined(USE_DISPATCH)
+	VectorL2SquaredDistancePtr = VectorL2SquaredDistanceDefault;
+	VectorInnerProductPtr = VectorInnerProductDefault;
+	VectorCosineSimilarityPtr = VectorCosineSimilarityDefault;
+
+	if (VectorSupportsAvxFma())
+	{
+		VectorL2SquaredDistancePtr = VectorL2SquaredDistanceAvxFma;
+		VectorInnerProductPtr = VectorInnerProductAvxFma;
+		VectorCosineSimilarityPtr = VectorCosineSimilarityAvxFma;
+	}
+#endif
 }
 
 /*
@@ -605,18 +716,6 @@ vector_l2_squared_distance(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8((double) VectorL2SquaredDistance(a->dim, a->x, b->x));
 }
 
-VECTOR_TARGET_CLONES static float
-VectorInnerProduct(int dim, float *ax, float *bx)
-{
-	float		distance = 0.0;
-
-	/* Auto-vectorized */
-	for (int i = 0; i < dim; i++)
-		distance += ax[i] * bx[i];
-
-	return distance;
-}
-
 /*
  * Get the inner product of two vectors
  */
@@ -645,25 +744,6 @@ vector_negative_inner_product(PG_FUNCTION_ARGS)
 	CheckDims(a, b);
 
 	PG_RETURN_FLOAT8((double) -VectorInnerProduct(a->dim, a->x, b->x));
-}
-
-VECTOR_TARGET_CLONES static double
-VectorCosineSimilarity(int dim, float *ax, float *bx)
-{
-	float		similarity = 0.0;
-	float		norma = 0.0;
-	float		normb = 0.0;
-
-	/* Auto-vectorized */
-	for (int i = 0; i < dim; i++)
-	{
-		similarity += ax[i] * bx[i];
-		norma += ax[i] * ax[i];
-		normb += bx[i] * bx[i];
-	}
-
-	/* Use sqrt(a * b) over sqrt(a) * sqrt(b) */
-	return (double) similarity / sqrt((double) norma * (double) normb);
 }
 
 /*
