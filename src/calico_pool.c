@@ -41,7 +41,7 @@ static void (*native_delete)(BufferTag *, uint32);
 static char *arena;
 static Size arena_size;
 static pg_atomic_uint32 *next_region;
-static pg_atomic_uint64 *frame_entries;
+pg_atomic_uint64 *calico_frame_entries;
 static LWLockPadded *prefix_locks;
 CalicoPathCache calico_path_cache;
 /* Keep the inline primary hit unchanged. A bounded backend-local victim
@@ -86,10 +86,10 @@ calico_pool_startup(void)
     next_region = ShmemInitStruct("Calico Next Region", sizeof(*next_region), &found);
     if (!found)
         pg_atomic_init_u32(next_region, 0);
-    frame_entries = ShmemInitStruct("Calico Frame Entries",
-                                    (Size) NBuffers * sizeof(*frame_entries), &found);
+    calico_frame_entries = ShmemInitStruct("Calico Frame Entries",
+                                           (Size) NBuffers * sizeof(*calico_frame_entries), &found);
     if (!found)
-        memset(frame_entries, 0, (Size) NBuffers * sizeof(*frame_entries));
+        memset(calico_frame_entries, 0, (Size) NBuffers * sizeof(*calico_frame_entries));
     prefix_locks = GetNamedLWLockTranche("calico_prefix");
 
     if (arena)
@@ -214,7 +214,7 @@ next_word(uint64 old, uint32 frame, uint64 flags)
 void
 calico_bind_frame(BufferDesc *buf, pg_atomic_uint64 *entry)
 {
-    calico_store_entry(&frame_entries[buf->buf_id], (uintptr_t) entry);
+    calico_store_entry(&calico_frame_entries[buf->buf_id], (uintptr_t) entry);
 }
 
 int
@@ -248,7 +248,7 @@ calico_table_insert(BufferTag *tag, uint32 hashcode, int frame)
             return (int) calico_frame(old);
         flags = (CALICO_READ_BUFFER_STATE(GetBufferDescriptor(frame)) & BM_VALID) ?
             CALICO_VALID : (CALICO_VALID | CALICO_UNREADY);
-        calico_store_entry(&frame_entries[frame], (uintptr_t) entry);
+        calico_store_entry(&calico_frame_entries[frame], (uintptr_t) entry);
         pg_write_barrier();
         calico_store_entry(entry, next_word(old, frame, flags));
         return -1;
@@ -269,7 +269,33 @@ calico_table_delete(BufferTag *tag, uint32 hashcode)
         if (!(old & CALICO_VALID) || (old & CALICO_LOCKED))
             elog(ERROR, "Calico mapping missing or writer locked during deletion");
         calico_store_entry(entry, next_word(old, 0, 0));
-        calico_store_entry(&frame_entries[calico_frame(old)], 0);
+        calico_store_entry(&calico_frame_entries[calico_frame(old)], 0);
+    }
+}
+
+void
+calico_table_delete_frame(BufferTag *tag, uint32 hashcode, int buf_id)
+{
+    if (!calico_local_active)
+    {
+        native_delete(tag, hashcode);
+    }
+    else
+    {
+        pg_atomic_uint64 *entry = (void *) (uintptr_t)
+            calico_load_entry(&calico_frame_entries[buf_id]);
+        uint64 old;
+
+        if (unlikely(entry == NULL))
+            entry = calico_entry_for(tag, false);
+
+        old = entry ? calico_load_entry(entry) : 0;
+        if (!(old & CALICO_VALID) || (old & CALICO_LOCKED) ||
+            (int) calico_frame(old) != buf_id)
+            elog(ERROR, "Calico mapping missing or writer locked during deletion");
+
+        calico_store_entry(entry, next_word(old, 0, 0));
+        calico_store_entry(&calico_frame_entries[buf_id], 0);
     }
 }
 
@@ -279,7 +305,7 @@ calico_writer_begin(BufferDesc *buf)
     if (calico_local_active)
     {
         pg_atomic_uint64 *entry = (void *) (uintptr_t)
-            calico_load_entry(&frame_entries[buf->buf_id]);
+            calico_load_entry(&calico_frame_entries[buf->buf_id]);
         if (entry)
         {
             uint64 old = calico_load_entry(entry);
@@ -299,7 +325,7 @@ calico_writer_end(BufferDesc *buf)
     if (calico_local_active)
     {
         pg_atomic_uint64 *entry = (void *) (uintptr_t)
-            calico_load_entry(&frame_entries[buf->buf_id]);
+            calico_load_entry(&calico_frame_entries[buf->buf_id]);
         if (entry)
         {
             uint64 old = calico_load_entry(entry);
@@ -343,7 +369,7 @@ calico_mark_frame_ready(BufferDesc *buf)
 
     if (!calico_local_active)
         return;
-    entry = (void *) (uintptr_t) calico_load_entry(&frame_entries[buf->buf_id]);
+    entry = (void *) (uintptr_t) calico_load_entry(&calico_frame_entries[buf->buf_id]);
     if (!entry)
         return;
     old = calico_load_entry(entry);
@@ -367,7 +393,7 @@ calico_mark_frame_unready(BufferDesc *buf)
 
     if (!calico_local_active)
         return;
-    entry = (void *) (uintptr_t) calico_load_entry(&frame_entries[buf->buf_id]);
+    entry = (void *) (uintptr_t) calico_load_entry(&calico_frame_entries[buf->buf_id]);
     if (!entry)
         return;
     old = calico_load_entry(entry);
@@ -393,7 +419,7 @@ calico_seed_frame(BufferDesc *buf, CalicoBufferState state)
         pg_atomic_uint64 *entry = calico_entry_for(&buf->tag, true);
         uint64 flags = (state & BM_VALID) ?
             CALICO_VALID : (CALICO_VALID | CALICO_UNREADY);
-        calico_store_entry(&frame_entries[buf->buf_id], (uintptr_t) entry);
+        calico_store_entry(&calico_frame_entries[buf->buf_id], (uintptr_t) entry);
         calico_store_entry(entry, next_word(calico_load_entry(entry),
                                             buf->buf_id, flags));
     }
@@ -416,10 +442,10 @@ calico_pool_seed(void)
         {
             if ((i & 1023) == 0)
                 calico_check_activation_deadline();
-            pg_atomic_uint64 *old = (void *) (uintptr_t) calico_load_entry(&frame_entries[i]);
+            pg_atomic_uint64 *old = (void *) (uintptr_t) calico_load_entry(&calico_frame_entries[i]);
             if (old)
                 calico_store_entry(old, 0);
-            calico_store_entry(&frame_entries[i], 0);
+            calico_store_entry(&calico_frame_entries[i], 0);
         }
     }
 

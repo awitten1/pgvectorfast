@@ -1431,17 +1431,27 @@ HnswPrefetchSlotTuple(const CalicoOptimisticSlot *slot, OffsetNumber offno, Size
 }
 
 /*
- * Load unvisited neighbors from disk
+ * Load unvisited neighbors from disk.
  * Populates slots_out (aligned 1-to-1 with unvisited[]) for downstream optimistic access and prefetching.
+ * When batch_out != NULL and missing blocks exist, starts async AIO reads without
+ * waiting so caller can evaluate resident neighbors concurrently.
  */
 static void
-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, HnswSupport * support, int m, int lm, int lc, CalicoOptimisticSlot *slots_out, Size tuple_prefetch_bytes)
+HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength,
+						  visited_hash * v, Relation index, HnswSupport * support, int m, int lm, int lc,
+						  CalicoOptimisticSlot *slots_out, Size tuple_prefetch_bytes,
+						  CalicoAsyncBatch *batch_out)
 {
 	ItemPointerData indextids[HNSW_MAX_M * 2];
 	bool		use_prefetch = false;
 	BlockNumber batch_blocknums[HNSW_MAX_M * 2];
 
 	*unvisitedLength = 0;
+	if (batch_out != NULL)
+	{
+		batch_out->active = false;
+		batch_out->num_ranges = 0;
+	}
 
 	if (!HnswLoadNeighborTids(element, indextids, index, support, m, lm, lc))
 		return;
@@ -1533,6 +1543,8 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 		int			count = *unvisitedLength;
 		BlockNumber missing_blocks[HNSW_MAX_M * 2];
 		int			missing_count = 0;
+		int			res_indices[HNSW_MAX_M * 2];
+		int			res_count = 0;
 
 		if (support != NULL)
 			calico_optimistic_lookup_batch_slots(&support->read_handle,
@@ -1567,6 +1579,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 				Page		prefetch_page = BufferGetPage(slots_out[j].frame_id + 1);
 				OffsetNumber offno = ItemPointerGetOffsetNumber(&unvisited[j].indextid);
 
+				res_indices[res_count++] = j;
 				__builtin_prefetch(prefetch_page, 0, 3);
 				if (offno > 10)
 					__builtin_prefetch(PageGetItemId(prefetch_page, offno), 0, 3);
@@ -1575,18 +1588,47 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 				missing_blocks[missing_count++] = batch_blocknums[j];
 		}
 
-		/*
-		 * Issue bulk async I/O for all missing blocks.
-		 * ReadBuffersAsync will group consecutive blocks and submit
-		 * all I/Os in one batch for maximum efficiency.
-		 */
 		if (missing_count > 0)
 		{
-			CalicoReadBuffersAsync(RelationGetSmgr(index),
-								   index->rd_rel->relpersistence,
-								   MAIN_FORKNUM,
-								   missing_blocks,
-								   missing_count);
+			if (batch_out != NULL)
+			{
+				CalicoAsyncBatchStart(batch_out,
+									  RelationGetSmgr(index),
+									  index->rd_rel->relpersistence,
+									  MAIN_FORKNUM,
+									  missing_blocks,
+									  missing_count);
+
+				if (batch_out->active)
+				{
+					/*
+					 * I/O is in flight; prime prefetch ONLY for resident neighbors
+					 * so Phase 1 can evaluate them immediately in parallel.
+					 */
+					if (tuple_prefetch_bytes > 0 && res_count > 0)
+					{
+						int			prime = Min(res_count, HNSW_PREFETCH_AHEAD);
+
+						for (int k = 0; k < prime; k++)
+						{
+							int			idx = res_indices[k];
+
+							HnswPrefetchSlotTuple(&slots_out[idx],
+												  ItemPointerGetOffsetNumber(&unvisited[idx].indextid),
+												  tuple_prefetch_bytes);
+						}
+					}
+					return;
+				}
+			}
+			else
+			{
+				CalicoReadBuffersAsync(RelationGetSmgr(index),
+									   index->rd_rel->relpersistence,
+									   MAIN_FORKNUM,
+									   missing_blocks,
+									   missing_count);
+			}
 
 			/* Refresh slots for newly fetched blocks so search uses fast inline path + prefetch */
 			if (support != NULL)
@@ -1632,8 +1674,61 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 	else
 	{
 		for (int j = 0; j < *unvisitedLength; j++)
+		{
+			slots_out[j].resident = false;
 			slots_out[j].opt_valid = false;
+		}
 	}
+}
+
+static inline void
+HnswCommitCandidate(char *base, HnswElement eElement, double eDistance,
+					HnswElement skipElement, int ef, int lc,
+					int *wlen, pairingheap *C, pairingheap *W,
+					pairingheap **discarded, HnswSearchCandidate **f_ptr)
+{
+	HnswSearchCandidate *f = *f_ptr;
+	HnswSearchCandidate *e;
+	bool		alwaysAdd = (*wlen < ef);
+
+	if (!(eDistance < f->distance || alwaysAdd))
+	{
+		if (discarded != NULL)
+		{
+			e = HnswInitSearchCandidate(base, eElement, eDistance);
+			pairingheap_add(*discarded, &e->w_node);
+		}
+		return;
+	}
+
+	/* Make robust to issues */
+	if (eElement->level < lc)
+		return;
+
+	e = HnswInitSearchCandidate(base, eElement, eDistance);
+	pairingheap_add(C, &e->c_node);
+	pairingheap_add(W, &e->w_node);
+
+	/*
+	 * Do not count elements being deleted towards ef when vacuuming. It would
+	 * be ideal to do this for inserts as well, but this could affect insert
+	 * performance.
+	 */
+	if (CountElement(skipElement, eElement))
+	{
+		(*wlen)++;
+
+		/* No need to decrement wlen */
+		if (*wlen > ef)
+		{
+			HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+			if (discarded != NULL)
+				pairingheap_add(*discarded, &d->w_node);
+		}
+	}
+
+	*f_ptr = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 }
 
 /*
@@ -1749,17 +1844,21 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
 		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		HnswElement cElement;
+		CalicoAsyncBatch async_batch;
 
 		if (c->distance > f->distance)
 			break;
 
 		cElement = HnswPtrAccess(base, c->element);
+		async_batch.active = false;
+		async_batch.num_ranges = 0;
 
 		if (inMemory)
 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
 		else
 			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, support, m, lm, lc,
-									  unvisited_slots, hnsw_enable_prefetch ? optPrefetchBytes : 0);
+									  unvisited_slots, hnsw_enable_prefetch ? optPrefetchBytes : 0,
+									  !inserting ? &async_batch : NULL);
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
@@ -1767,89 +1866,173 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 		f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
-		for (int i = 0; i < unvisitedLength; i++)
+		if (inMemory || !async_batch.active)
 		{
-			HnswElement eElement;
-			HnswSearchCandidate *e;
-			double		eDistance;
-			bool		alwaysAdd = wlen < ef;
-
-			/* Prefetch full tuple + vector several steps ahead while evaluating earlier items */
-			if (!inMemory && hnsw_enable_prefetch && i + HNSW_PREFETCH_AHEAD < unvisitedLength)
+			for (int i = 0; i < unvisitedLength; i++)
 			{
-				HnswPrefetchSlotTuple(&unvisited_slots[i + HNSW_PREFETCH_AHEAD],
-									  ItemPointerGetOffsetNumber(&unvisited[i + HNSW_PREFETCH_AHEAD].indextid),
-									  optPrefetchBytes);
+				HnswElement eElement;
+				double		eDistance;
+				bool		alwaysAdd = wlen < ef;
+
+				/* Prefetch full tuple + vector several steps ahead while evaluating earlier items */
+				if (!inMemory && hnsw_enable_prefetch && i + HNSW_PREFETCH_AHEAD < unvisitedLength)
+				{
+					HnswPrefetchSlotTuple(&unvisited_slots[i + HNSW_PREFETCH_AHEAD],
+										  ItemPointerGetOffsetNumber(&unvisited[i + HNSW_PREFETCH_AHEAD].indextid),
+										  optPrefetchBytes);
+				}
+
+				if (inMemory)
+				{
+					eElement = unvisited[i].element;
+					eDistance = GetElementDistance(base, eElement, q, support);
+				}
+				else
+				{
+					ItemPointer indextid = &unvisited[i].indextid;
+					BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
+					OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
+					double	   *maxDistPtr = alwaysAdd || discarded != NULL ? NULL : &f->distance;
+
+					/* Avoid any allocations if not adding */
+					eElement = NULL;
+					if (!canOptL2 ||
+						!HnswLoadElementOptimisticSlot(blkno, offno, &unvisited_slots[i],
+													   &eDistance, queryVec, optVecSize,
+													   maxDistPtr, &eElement))
+					{
+						HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support,
+											inserting, maxDistPtr, &eElement);
+					}
+
+					if (eElement == NULL)
+						continue;
+				}
+
+				HnswCommitCandidate(base, eElement, eDistance, skipElement,
+									ef, lc, &wlen, C, W, discarded, &f);
+			}
+		}
+		else
+		{
+			bool		processed[HNSW_MAX_M * 2];
+			int			res_idxs[HNSW_MAX_M * 2];
+			int			n_res = 0;
+			int			rem_idxs[HNSW_MAX_M * 2];
+			BlockNumber rem_blks[HNSW_MAX_M * 2];
+			CalicoOptimisticSlot rem_slots[HNSW_MAX_M * 2];
+			int			n_rem = 0;
+
+			for (int i = 0; i < unvisitedLength; i++)
+			{
+				processed[i] = false;
+				if (unvisited_slots[i].resident && unvisited_slots[i].opt_valid)
+					res_idxs[n_res++] = i;
 			}
 
-			if (inMemory)
+			/* Phase 1: evaluate resident neighbors concurrently with io_uring NVMe reads */
+			for (int r = 0; r < n_res; r++)
 			{
-				eElement = unvisited[i].element;
-				eDistance = GetElementDistance(base, eElement, q, support);
-			}
-			else
-			{
-				ItemPointer indextid = &unvisited[i].indextid;
+				int			idx = res_idxs[r];
+				ItemPointer indextid = &unvisited[idx].indextid;
 				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
 				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
+				HnswElement eElement = NULL;
+				double		eDistance;
+				bool		alwaysAdd = (wlen < ef);
 				double	   *maxDistPtr = alwaysAdd || discarded != NULL ? NULL : &f->distance;
 
-				/* Avoid any allocations if not adding */
-				eElement = NULL;
-				if (!canOptL2 ||
-					!HnswLoadElementOptimisticSlot(blkno, offno, &unvisited_slots[i],
+				if (hnsw_enable_prefetch && r + HNSW_PREFETCH_AHEAD < n_res)
+				{
+					int			p_idx = res_idxs[r + HNSW_PREFETCH_AHEAD];
+
+					HnswPrefetchSlotTuple(&unvisited_slots[p_idx],
+										  ItemPointerGetOffsetNumber(&unvisited[p_idx].indextid),
+										  optPrefetchBytes);
+				}
+
+				if (canOptL2 &&
+					HnswLoadElementOptimisticSlot(blkno, offno, &unvisited_slots[idx],
 												   &eDistance, queryVec, optVecSize,
 												   maxDistPtr, &eElement))
 				{
-					HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support,
-										inserting, maxDistPtr, &eElement);
+					processed[idx] = true;
+					if (eElement != NULL)
+						HnswCommitCandidate(base, eElement, eDistance, skipElement,
+											ef, lc, &wlen, C, W, discarded, &f);
 				}
-
-				if (eElement == NULL)
-					continue;
 			}
 
-			if (!(eDistance < f->distance || alwaysAdd))
+			/* Phase 2: wait for async reads, mark frames ready & release pins */
+			CalicoAsyncBatchFinish(&async_batch);
+
+			for (int i = 0; i < unvisitedLength; i++)
 			{
-				if (discarded != NULL)
+				if (!processed[i])
 				{
-					/* Create a new candidate */
-					e = HnswInitSearchCandidate(base, eElement, eDistance);
-					pairingheap_add(*discarded, &e->w_node);
+					rem_idxs[n_rem] = i;
+					rem_blks[n_rem] = ItemPointerGetBlockNumber(&unvisited[i].indextid);
+					n_rem++;
 				}
-
-				continue;
 			}
 
-			/* Make robust to issues */
-			if (eElement->level < lc)
-				continue;
-
-			/* Create a new candidate */
-			e = HnswInitSearchCandidate(base, eElement, eDistance);
-			pairingheap_add(C, &e->c_node);
-			pairingheap_add(W, &e->w_node);
-
-			/*
-			 * Do not count elements being deleted towards ef when vacuuming.
-			 * It would be ideal to do this for inserts as well, but this
-			 * could affect insert performance.
-			 */
-			if (CountElement(skipElement, eElement))
+			if (n_rem > 0)
 			{
-				wlen++;
-
-				/* No need to decrement wlen */
-				if (wlen > ef)
+				if (support != NULL)
 				{
-					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+					calico_optimistic_lookup_batch_slots(&support->read_handle,
+														 rem_blks, n_rem, rem_slots);
+					for (int k = 0; k < n_rem; k++)
+						unvisited_slots[rem_idxs[k]] = rem_slots[k];
+				}
 
-					if (discarded != NULL)
-						pairingheap_add(*discarded, &d->w_node);
+				if (hnsw_enable_prefetch)
+				{
+					int			prime = Min(n_rem, HNSW_PREFETCH_AHEAD);
+
+					for (int k = 0; k < prime; k++)
+					{
+						int			p_idx = rem_idxs[k];
+
+						HnswPrefetchSlotTuple(&unvisited_slots[p_idx],
+											  ItemPointerGetOffsetNumber(&unvisited[p_idx].indextid),
+											  optPrefetchBytes);
+					}
+				}
+
+				for (int k = 0; k < n_rem; k++)
+				{
+					int			idx = rem_idxs[k];
+					BlockNumber blkno = rem_blks[k];
+					OffsetNumber offno = ItemPointerGetOffsetNumber(&unvisited[idx].indextid);
+					HnswElement eElement = NULL;
+					double		eDistance;
+					bool		alwaysAdd = (wlen < ef);
+					double	   *maxDistPtr = alwaysAdd || discarded != NULL ? NULL : &f->distance;
+
+					if (hnsw_enable_prefetch && k + HNSW_PREFETCH_AHEAD < n_rem)
+					{
+						int			p_idx = rem_idxs[k + HNSW_PREFETCH_AHEAD];
+
+						HnswPrefetchSlotTuple(&unvisited_slots[p_idx],
+											  ItemPointerGetOffsetNumber(&unvisited[p_idx].indextid),
+											  optPrefetchBytes);
+					}
+
+					if (!canOptL2 ||
+						!HnswLoadElementOptimisticSlot(blkno, offno, &unvisited_slots[idx],
+													   &eDistance, queryVec, optVecSize,
+													   maxDistPtr, &eElement))
+					{
+						HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support,
+											inserting, maxDistPtr, &eElement);
+					}
+
+					if (eElement != NULL)
+						HnswCommitCandidate(base, eElement, eDistance, skipElement,
+											ef, lc, &wlen, C, W, discarded, &f);
 				}
 			}
-
-			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		}
 	}
 

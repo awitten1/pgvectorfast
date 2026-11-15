@@ -104,163 +104,279 @@ calico_activate(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
-/* Group adjacent requests, stage their I/O together, then wait and unpin.
+/* Group sorted, deduplicated adjacent requests, stage their I/O together
+ * in batches of up to CALICO_ASYNC_BATCH_MAX blocks, then wait and unpin.
  * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  */
 static void
-calico_read_buffers_window(SMgrRelation smgr_reln,
-				 char persistence,
-				 ForkNumber forkNum,
-				 BlockNumber *blockNums,
-				 int nblocks)
+calico_sort_unique_blocks(const BlockNumber *in, int count,
+                          BlockNumber *out, int *uniq_count_out)
 {
-	ReadBuffersOperation operations[16] = {{0}};
-    Buffer buffers[16] = {0};
-	Buffer	   *range_buffers_array[16];
-	int			range_sizes[16];
-	int			num_ranges = 0;
-	int			flags = 0;
-	int			i = 0;
+    int n = 0;
+    int u;
 
-	if (nblocks <= 0)
-		return;
-
-	/* 
-	 * First pass: count how many contiguous ranges we have.
-	 */
-	while (i < nblocks)
-	{
-		int range_size = 1;
-		while (i + range_size < nblocks &&
-			   blockNums[i + range_size] == blockNums[i] + range_size)
-		{
-			range_size++;
-		}
-		num_ranges++;
-		i += range_size;
-	}
-
-	/* Second pass: prepare all operations */
-	i = 0;
-	for (int range_idx = 0; range_idx < num_ranges; range_idx++)
-	{
-		BlockNumber start_block = blockNums[i];
-		int range_size = 1;
-		
-		/* Find the length of this consecutive range */
-		while (i + range_size < nblocks &&
-			   blockNums[i + range_size] == start_block + range_size)
-		{
-			range_size++;
-		}
-
-		/* Initialize operation for this range */
-		operations[range_idx].smgr = smgr_reln;
-		operations[range_idx].rel = NULL;
-		operations[range_idx].persistence = persistence;
-		operations[range_idx].forknum = forkNum;
-		operations[range_idx].strategy = NULL;
-
-        /* Bounded flat storage avoids a palloc/pfree for each range. */
-        range_buffers_array[range_idx] = buffers + i;
-        range_sizes[range_idx] = range_size;
-
-		i += range_size;
-	}
-
-	/*
-	 * Enter batch mode to stage all I/Os without submitting them.
-	 * This is critical for performance - we want to submit all I/Os
-	 * in one batch to the kernel.
-	 */
-	pgaio_enter_batchmode();
-
-	/* Third pass: start all reads (staged but not submitted) */
-    PG_TRY();
+    for (int i = 0; i < count; i++)
     {
-	i = 0;
-	for (int range_idx = 0; range_idx < num_ranges; range_idx++)
-	{
-		BlockNumber start_block = blockNums[i];
-		int range_size = range_sizes[range_idx];
-		bool need_wait;
-		
-		/* Start the read - this stages but doesn't submit in batch mode */
-		need_wait = StartReadBuffers(&operations[range_idx],
-									 range_buffers_array[range_idx],
-									 start_block,
-									 &range_size,
-									 flags);
-		
-		/* 
-		 * If StartReadBuffers returned false, no I/O was needed (all buffers were cache hits).
-		 * Mark this operation so we know not to wait for it.
-		 */
-		if (!need_wait)
-		{
-			operations[range_idx].nblocks = 0;
-		}
-		
-        if (range_size < range_sizes[range_idx])
+        BlockNumber key = in[i];
+        int j = n;
+
+        while (j > 0 && out[j - 1] > key)
         {
-            Assert(range_size > 0 && num_ranges < 16);
-            for (int next = num_ranges; next > range_idx + 1; next--)
-            {
-                range_sizes[next] = range_sizes[next - 1];
-                range_buffers_array[next] = range_buffers_array[next - 1];
-            }
-            range_sizes[range_idx + 1] = range_sizes[range_idx] - range_size;
-            range_buffers_array[range_idx + 1] = range_buffers_array[range_idx] + range_size;
-            range_sizes[range_idx] = range_size;
-            operations[num_ranges].smgr = smgr_reln;
-            operations[num_ranges].persistence = persistence;
-            operations[num_ranges].forknum = forkNum;
-            num_ranges++;
+            out[j] = out[j - 1];
+            j--;
         }
-		i += range_sizes[range_idx];
-	}
+        out[j] = key;
+        n++;
     }
-    PG_FINALLY();
+
+    if (n <= 1)
     {
-        pgaio_exit_batchmode();
+        *uniq_count_out = n;
+        return;
     }
-    PG_END_TRY();
 
-	/* Fourth pass: wait for all I/Os to complete */
-	for (int range_idx = 0; range_idx < num_ranges; range_idx++)
-	{
-		/* 
-		 * Only wait if I/O was actually started (need_wait was true).
-		 * We marked operations with no I/O by setting nblocks to 0.
-		 */
-		if (operations[range_idx].nblocks > 0)
-		{
-			WaitReadBuffers(&operations[range_idx]);
-		}
-		
-		/* Release the pinned buffers - caller will re-pin via mapping table */
-		for (int j = 0; j < range_sizes[range_idx]; j++)
-		{
-			Buffer b = range_buffers_array[range_idx][j];
+    u = 1;
+    for (int i = 1; i < n; i++)
+    {
+        if (out[i] != out[u - 1])
+            out[u++] = out[i];
+    }
+    *uniq_count_out = u;
+}
 
-			if (BufferIsValid(b))
-			{
-				if (calico_is_active() && !BufferIsLocal(b))
-					calico_mark_frame_ready(GetBufferDescriptor(b - 1));
-				ReleaseBuffer(b);
-			}
-		}
-		
+static void
+calico_async_batch_stage(CalicoAsyncBatch *batch,
+                         SMgrRelation smgr_reln,
+                         char persistence,
+                         ForkNumber forkNum,
+                         const BlockNumber *sorted_uniq,
+                         int nblocks)
+{
+    int num_ranges = 0;
+    int i = 0;
+    int staged = 0;
+    bool any_io = false;
 
-	}
+    batch->active = false;
+    batch->num_ranges = 0;
+
+    if (nblocks <= 0)
+        return;
+
+    Assert(nblocks <= CALICO_ASYNC_BATCH_MAX);
+    memset(batch->buffers, 0, (Size) nblocks * sizeof(Buffer));
+
+    /* Build contiguous ranges capped at MAX_IO_COMBINE_LIMIT */
+    while (i < nblocks)
+    {
+        int range_size = 1;
+
+        while (i + range_size < nblocks &&
+               range_size < MAX_IO_COMBINE_LIMIT &&
+               sorted_uniq[i + range_size] == sorted_uniq[i] + range_size)
+        {
+            range_size++;
+        }
+
+        memset(&batch->operations[num_ranges], 0, sizeof(ReadBuffersOperation));
+        batch->operations[num_ranges].smgr = smgr_reln;
+        batch->operations[num_ranges].rel = NULL;
+        batch->operations[num_ranges].persistence = persistence;
+        batch->operations[num_ranges].forknum = forkNum;
+        batch->operations[num_ranges].strategy = NULL;
+
+        batch->range_buffers[num_ranges] = batch->buffers + i;
+        batch->range_sizes[num_ranges] = range_size;
+        num_ranges++;
+        i += range_size;
+    }
+
+    {
+        bool in_batch = true;
+
+        pgaio_enter_batchmode();
+
+        PG_TRY();
+        {
+            i = 0;
+            for (int range_idx = 0; range_idx < num_ranges; range_idx++)
+            {
+                BlockNumber start_block = sorted_uniq[i];
+                int orig_size = batch->range_sizes[range_idx];
+                int range_size = orig_size;
+                bool need_wait;
+
+                need_wait = StartReadBuffers(&batch->operations[range_idx],
+                                             batch->range_buffers[range_idx],
+                                             start_block,
+                                             &range_size,
+                                             0);
+
+                if (!need_wait)
+                    batch->operations[range_idx].nblocks = 0;
+                else
+                {
+                    any_io = true;
+                    staged++;
+                }
+
+                if (range_size < orig_size)
+                {
+                    Assert(range_size > 0 && num_ranges < CALICO_ASYNC_BATCH_MAX);
+                    for (int next = num_ranges; next > range_idx + 1; next--)
+                    {
+                        batch->operations[next] = batch->operations[next - 1];
+                        batch->range_sizes[next] = batch->range_sizes[next - 1];
+                        batch->range_buffers[next] = batch->range_buffers[next - 1];
+                    }
+                    memset(&batch->operations[range_idx + 1], 0, sizeof(ReadBuffersOperation));
+                    batch->operations[range_idx + 1].smgr = smgr_reln;
+                    batch->operations[range_idx + 1].rel = NULL;
+                    batch->operations[range_idx + 1].persistence = persistence;
+                    batch->operations[range_idx + 1].forknum = forkNum;
+                    batch->operations[range_idx + 1].strategy = NULL;
+                    batch->range_sizes[range_idx + 1] = orig_size - range_size;
+                    batch->range_buffers[range_idx + 1] = batch->range_buffers[range_idx] + range_size;
+                    batch->range_sizes[range_idx] = range_size;
+                    num_ranges++;
+                }
+
+                i += batch->range_sizes[range_idx];
+
+                /* Respect pgaio's per-batch staged handle cap (32) */
+                if (staged >= 32 && range_idx + 1 < num_ranges)
+                {
+                    in_batch = false;
+                    pgaio_exit_batchmode();
+                    staged = 0;
+                    pgaio_enter_batchmode();
+                    in_batch = true;
+                }
+            }
+        }
+        PG_FINALLY();
+        {
+            if (in_batch)
+                pgaio_exit_batchmode();
+        }
+        PG_END_TRY();
+    }
+
+    batch->num_ranges = num_ranges;
+
+    if (!any_io)
+    {
+        /* All buffers were cache hits: release immediately without marking active */
+        for (int range_idx = 0; range_idx < num_ranges; range_idx++)
+        {
+            for (int j = 0; j < batch->range_sizes[range_idx]; j++)
+            {
+                Buffer b = batch->range_buffers[range_idx][j];
+
+                if (BufferIsValid(b))
+                {
+                    if (calico_is_active() && !BufferIsLocal(b))
+                        calico_mark_frame_ready(GetBufferDescriptor(b - 1));
+                    ReleaseBuffer(b);
+                }
+            }
+        }
+        batch->num_ranges = 0;
+        return;
+    }
+
+    batch->active = true;
+}
+
+void
+CalicoAsyncBatchStart(CalicoAsyncBatch *batch,
+                      SMgrRelation smgr_reln,
+                      char persistence,
+                      ForkNumber forkNum,
+                      const BlockNumber *blocks,
+                      int count)
+{
+    BlockNumber sorted[256];
+    int uniq_count;
+    int offset = 0;
+
+    batch->active = false;
+    batch->num_ranges = 0;
+
+    if (count <= 0)
+        return;
+
+    while (count > 256)
+    {
+        CalicoAsyncBatch tmp;
+
+        calico_sort_unique_blocks(blocks + offset, 256, sorted, &uniq_count);
+        for (int pos = 0; pos < uniq_count; pos += CALICO_ASYNC_BATCH_MAX)
+        {
+            calico_async_batch_stage(&tmp, smgr_reln, persistence, forkNum,
+                                     sorted + pos, Min(uniq_count - pos, CALICO_ASYNC_BATCH_MAX));
+            CalicoAsyncBatchFinish(&tmp);
+        }
+        offset += 256;
+        count -= 256;
+    }
+
+    calico_sort_unique_blocks(blocks + offset, count, sorted, &uniq_count);
+    for (int pos = 0; pos < uniq_count; pos += CALICO_ASYNC_BATCH_MAX)
+    {
+        int chunk = Min(uniq_count - pos, CALICO_ASYNC_BATCH_MAX);
+
+        if (pos + chunk < uniq_count)
+        {
+            CalicoAsyncBatch tmp;
+
+            calico_async_batch_stage(&tmp, smgr_reln, persistence, forkNum,
+                                     sorted + pos, chunk);
+            CalicoAsyncBatchFinish(&tmp);
+        }
+        else
+        {
+            calico_async_batch_stage(batch, smgr_reln, persistence, forkNum,
+                                     sorted + pos, chunk);
+        }
+    }
+}
+
+void
+CalicoAsyncBatchFinish(CalicoAsyncBatch *batch)
+{
+    if (!batch->active)
+        return;
+
+    for (int range_idx = 0; range_idx < batch->num_ranges; range_idx++)
+    {
+        if (batch->operations[range_idx].nblocks > 0)
+            WaitReadBuffers(&batch->operations[range_idx]);
+
+        for (int j = 0; j < batch->range_sizes[range_idx]; j++)
+        {
+            Buffer b = batch->range_buffers[range_idx][j];
+
+            if (BufferIsValid(b))
+            {
+                if (calico_is_active() && !BufferIsLocal(b))
+                    calico_mark_frame_ready(GetBufferDescriptor(b - 1));
+                ReleaseBuffer(b);
+            }
+        }
+    }
+
+    batch->active = false;
+    batch->num_ranges = 0;
 }
 
 void
 CalicoReadBuffersAsync(SMgrRelation smgr, char persistence, ForkNumber fork,
                        BlockNumber *blocks, int count)
 {
-    for (int first = 0; first < count; first += 16)
-        calico_read_buffers_window(smgr, persistence, fork,
-                                   blocks + first, Min(count - first, 16));
+    CalicoAsyncBatch batch;
+
+    CalicoAsyncBatchStart(&batch, smgr, persistence, fork, blocks, count);
+    CalicoAsyncBatchFinish(&batch);
 }

@@ -86,6 +86,28 @@ extern void CalicoLookupAndOptimisticPinBatch(SMgrRelation smgr,
     uint32 *frames, bool *found);
 extern void CalicoReadBuffersAsync(SMgrRelation smgr, char persistence,
     ForkNumber fork, BlockNumber *blocks, int count);
+#ifndef CALICO_IN_BUFMGR
+#include "storage/bufmgr.h"
+#define CALICO_ASYNC_BATCH_MAX 64
+
+typedef struct CalicoAsyncBatch
+{
+    ReadBuffersOperation operations[CALICO_ASYNC_BATCH_MAX];
+    Buffer      buffers[CALICO_ASYNC_BATCH_MAX];
+    Buffer     *range_buffers[CALICO_ASYNC_BATCH_MAX];
+    int         range_sizes[CALICO_ASYNC_BATCH_MAX];
+    int         num_ranges;
+    bool        active;
+} CalicoAsyncBatch;
+
+extern void CalicoAsyncBatchStart(CalicoAsyncBatch *batch,
+                                  SMgrRelation smgr,
+                                  char persistence,
+                                  ForkNumber fork,
+                                  const BlockNumber *blocks,
+                                  int count);
+extern void CalicoAsyncBatchFinish(CalicoAsyncBatch *batch);
+#endif
 extern __attribute__((visibility("hidden"))) bool calico_local_active;
 static inline __attribute__((always_inline)) bool
 calico_is_active(void)
@@ -100,6 +122,21 @@ extern void calico_install_table(void);
 extern int calico_table_lookup(BufferTag *tag, uint32 hashcode);
 extern int calico_table_insert(BufferTag *tag, uint32 hashcode, int frame);
 extern void calico_table_delete(BufferTag *tag, uint32 hashcode);
+extern void calico_table_delete_frame(BufferTag *tag, uint32 hashcode, int buf_id);
+extern __attribute__((visibility("hidden"))) pg_atomic_uint64 *calico_frame_entries;
+
+static inline __attribute__((always_inline)) void
+calico_prefetch_victim_entry(int buf_id)
+{
+    if (calico_local_active && calico_frame_entries != NULL)
+    {
+        uintptr_t addr = (uintptr_t) __atomic_load_n(&calico_frame_entries[buf_id].value,
+                                                     __ATOMIC_RELAXED);
+
+        if (addr != 0)
+            __builtin_prefetch((const void *) addr, 1, 3);
+    }
+}
 typedef struct CalicoPrefix
 {
     Oid tablespace;

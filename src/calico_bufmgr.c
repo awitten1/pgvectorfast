@@ -2,6 +2,7 @@
  * Calico lookup, pin accounting and writer integration. Version-specific
  * PostgreSQL read and writer adapters are maintained alongside this file.
  */
+#define CALICO_IN_BUFMGR 1
 #include "postgres.h"
 #include "port/pg_bitutils.h"
 #include <dlfcn.h>
@@ -39,8 +40,6 @@ calico_lookup_and_pin_slow(BufferTag *tag,
 {
     uint64 entry_val;
     ForkNumber forkNum = tag->forkNum;
-
-    ReservePrivateRefCountEntry();
     uint32 newHash = BufTableHashCode(tag);
     LWLock *plock = BufMappingPartitionLock(newHash);
 
@@ -83,7 +82,6 @@ calico_lookup_and_pin_slow(BufferTag *tag,
     // EVICTED STATE
 
 miss_path:
-    ReservePrivateRefCountEntry();
     /* ------------- MISS PATH ------------- */
     {
         Buffer victim_buf = GetVictimBuffer(strategy, io_context);

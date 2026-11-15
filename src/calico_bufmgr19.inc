@@ -1925,6 +1925,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 
 	/* have buffer pinned, so it's safe to read tag without lock */
 	tag = buf_hdr->tag;
+	calico_prefetch_victim_entry(buf_hdr->buf_id);
 
 	hash = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hash);
@@ -1978,7 +1979,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
 
 	/* finally delete buffer from the buffer mapping table */
-	BufTableDelete(&tag, hash);
+	calico_table_delete_frame(&tag, hash, buf_hdr->buf_id);
 
 	LWLockRelease(partition_lock);
 
@@ -2013,6 +2014,8 @@ again:
 	 * this backend.
 	 */
 	buf_hdr = StrategyGetBuffer(strategy, &buf_state, &from_ring);
+	if (calico_is_active() && (buf_state & BM_TAG_VALID) && calico_frame_entries != NULL)
+		__builtin_prefetch(&calico_frame_entries[buf_hdr->buf_id], 0, 3);
 	buf = BufferDescriptorGetBuffer(buf_hdr);
 
 	/*
