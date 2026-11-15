@@ -436,6 +436,16 @@ typedef union
 	ItemPointerData indextid;
 }			HnswUnvisited;
 
+#define HNSW_HEAP_PREFETCH_MAX 12
+
+typedef struct HnswFastResultCand
+{
+	double		distance;
+	BlockNumber blkno;
+	OffsetNumber offno;
+	uint16		_pad;
+}			HnswFastResultCand;
+
 typedef struct HnswScanOpaqueData
 {
 	const		HnswTypeInfo *typeInfo;
@@ -454,6 +464,20 @@ typedef struct HnswScanOpaqueData
 
 	/* Support functions */
 	HnswSupport support;
+	CalicoReadHandle heap_handle;
+	bool		heap_handle_inited;
+	uint8		heap_pref_count;
+	uint8		heap_pref_idx;
+	OffsetNumber heap_offs[HNSW_HEAP_PREFETCH_MAX];
+	CalicoOptimisticSlot heap_slots[HNSW_HEAP_PREFETCH_MAX];
+	HnswFastResultCand *fast_cands;
+	int			fast_count;
+	int			fast_idx;
+	int			fast_loaded_start;
+	int			fast_loaded_end;
+	HnswFastResultCand fast_inline[64];
+	ItemPointerData fast_win_tids[HNSW_HEAP_PREFETCH_MAX][HNSW_HEAPTIDS];
+	uint8		fast_win_len[HNSW_HEAP_PREFETCH_MAX];
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;
@@ -496,9 +520,13 @@ void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
 void		HnswAcquireScanVisited(HnswFastVisited *fv, MemoryContext scanCtx, MemoryContext tmpCtx, MemoryContextCallback *cb, bool *cbRegistered);
 void		HnswReleaseScanVisited(HnswFastVisited *fv);
+bool		HnswSearchLayerFastCands(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswFastResultCand *inline_buf, int inline_cap, HnswFastResultCand **fast_out, int *fast_count_out);
+bool		HnswSearchLayerFromEntryFastCands(char *base, HnswQuery * q, HnswElement entryPoint, int ef, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswFastResultCand *inline_buf, int inline_cap, HnswFastResultCand **fast_out, int *fast_count_out);
+void		HnswLoadFastWindow(Relation index, HnswSupport * support, const HnswFastResultCand *cands, int start_idx, int count, bool allow_deleted, ItemPointerData win_tids[][HNSW_HEAPTIDS], uint8 *win_len);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint);
+void		HnswGetMetaPageInfoWithHandle(Relation index, CalicoReadHandle *handle, int *m, int *dimensions, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);

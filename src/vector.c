@@ -142,22 +142,21 @@ InitVector(int dim)
 	return result;
 }
 
-#if PG_VERSION_NUM >= 170000
-#define vector_isspace(ch) scanner_isspace(ch)
-#else
 static inline bool
 vector_isspace(char ch)
 {
-	if (ch == ' ' ||
-		ch == '\t' ||
-		ch == '\n' ||
-		ch == '\r' ||
-		ch == '\v' ||
-		ch == '\f')
+	unsigned char uc = (unsigned char) ch;
+
+	if (likely(uc > ' '))
+		return false;
+	if (likely(uc == ' ' || (uc >= '\t' && uc <= '\r')))
 		return true;
+#if PG_VERSION_NUM >= 170000
+	return scanner_isspace(ch);
+#else
 	return false;
-}
 #endif
+}
 
 /*
  * Check state array
@@ -176,16 +175,159 @@ CheckStateArray(ArrayType *statearray, const char *caller)
 /*
  * Convert textual representation to internal representation
  */
+static pg_attribute_always_inline bool
+vector_fast_strtof(const char *str, char **endptr, float *out)
+{
+	static const double pow10_pos[13] = {
+		1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6,
+		1e7, 1e8, 1e9, 1e10, 1e11, 1e12
+	};
+	const char *p = str;
+	bool		neg = false;
+	bool		saw_digit = false;
+	uint64		mant = 0;
+	int			sig = 0;
+	int			frac = 0;
+	int			exp10;
+	float		val;
+
+	if (*p == '-')
+	{
+		neg = true;
+		p++;
+	}
+	else if (*p == '+')
+		p++;
+
+	if ((unsigned) (*p - '0') < 10U)
+	{
+		saw_digit = true;
+		while (*p == '0')
+			p++;
+		if ((unsigned) (*p - '0') < 10U)
+		{
+			const char *istart = p;
+			const char *ilimit = p + 15;
+
+			while ((unsigned) (*p - '0') < 10U)
+			{
+				if (unlikely(p >= ilimit))
+					return false;
+				mant = mant * 10 + (unsigned) (*p - '0');
+				p++;
+			}
+			sig = (int) (p - istart);
+		}
+	}
+
+	if (*p == '.')
+	{
+		p++;
+		if ((unsigned) (*p - '0') < 10U)
+		{
+			const char *fstart;
+			const char *flimit;
+			int			room;
+
+			saw_digit = true;
+			if (mant == 0)
+			{
+				const char *zstart = p;
+				const char *zlimit = p + 12;
+
+				while (*p == '0')
+				{
+					if (unlikely(p >= zlimit))
+						return false;
+					p++;
+				}
+				frac = (int) (p - zstart);
+			}
+			fstart = p;
+			room = Min(15 - sig, 12 - frac);
+			flimit = p + room;
+			while ((unsigned) (*p - '0') < 10U)
+			{
+				if (unlikely(p >= flimit))
+					return false;
+				mant = mant * 10 + (unsigned) (*p - '0');
+				p++;
+			}
+			frac += (int) (p - fstart);
+			sig += (int) (p - fstart);
+		}
+	}
+
+	if (unlikely(!saw_digit))
+		return false;
+
+	exp10 = -frac;
+	if (*p == 'e' || *p == 'E')
+	{
+		const char *ep = p + 1;
+		bool		eneg = false;
+		int			eval = 0;
+
+		if (*ep == '-')
+		{
+			eneg = true;
+			ep++;
+		}
+		else if (*ep == '+')
+			ep++;
+
+		if (unlikely((unsigned) (*ep - '0') >= 10U))
+			return false;
+		while ((unsigned) (*ep - '0') < 10U)
+		{
+			if (unlikely(eval > 100))
+				return false;
+			eval = eval * 10 + (*ep - '0');
+			ep++;
+		}
+		exp10 += eneg ? -eval : eval;
+		p = ep;
+	}
+
+	if (unlikely(*p != ',' && *p != ']' && *p != '\0' && !vector_isspace(*p)))
+		return false;
+
+	if (mant == 0)
+	{
+		uint32		zb = neg ? 0x80000000U : 0U;
+
+		memcpy(out, &zb, sizeof(float));
+		*endptr = (char *) p;
+		return true;
+	}
+
+	if (exp10 == 0)
+		val = (float) mant;
+	else if (exp10 < 0 && exp10 >= -12)
+		val = (float) ((double) mant / pow10_pos[-exp10]);
+	else if (exp10 > 0 && exp10 <= 12 && sig + exp10 <= 15)
+		val = (float) ((double) mant * pow10_pos[exp10]);
+	else
+		return false;
+
+	*out = neg ? -val : val;
+	*endptr = (char *) p;
+	return true;
+}
+
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(vector_in);
 Datum
 vector_in(PG_FUNCTION_ARGS)
 {
 	char	   *lit = PG_GETARG_CSTRING(0);
 	int32		typmod = PG_GETARG_INT32(2);
-	float		x[VECTOR_MAX_DIM];
+	float		x_stack[256];
+	float	   *x = x_stack;
+	int			x_cap = lengthof(x_stack);
 	int			dim = 0;
 	char	   *pt = lit;
 	Vector	   *result;
+	Size		size;
 
 	while (vector_isspace(*pt))
 		pt++;
@@ -211,10 +353,24 @@ vector_in(PG_FUNCTION_ARGS)
 		float		val;
 		char	   *stringEnd;
 
-		if (dim == VECTOR_MAX_DIM)
+		if (unlikely(dim == VECTOR_MAX_DIM))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("vector cannot have more than %d dimensions", VECTOR_MAX_DIM)));
+
+		if (unlikely(dim == x_cap))
+		{
+			int			newcap = Min(x_cap * 2, VECTOR_MAX_DIM);
+
+			if (x == x_stack)
+			{
+				x = palloc_array_checked(float, newcap);
+				memcpy(x, x_stack, sizeof(float) * (Size) dim);
+			}
+			else
+				x = (float *) repalloc(x, mul_size(sizeof(float), newcap));
+			x_cap = newcap;
+		}
 
 		while (vector_isspace(*pt))
 			pt++;
@@ -225,24 +381,28 @@ vector_in(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
 
-		errno = 0;
+		if (unlikely(!vector_fast_strtof(pt, &stringEnd, &val)))
+		{
+			errno = 0;
 
-		/* Use strtof like float4in to avoid a double-rounding problem */
-		/* Postgres sets LC_NUMERIC to C on startup */
-		val = strtof(pt, &stringEnd);
+			/* Use strtof like float4in to avoid a double-rounding problem */
+			/* Postgres sets LC_NUMERIC to C on startup */
+			val = strtof(pt, &stringEnd);
 
-		if (stringEnd == pt)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
+			if (stringEnd == pt)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid input syntax for type vector: \"%s\"", lit)));
 
-		/* Check for range error like float4in */
-		if (errno == ERANGE && isinf(val))
-			ereport(ERROR,
-					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("\"%s\" is out of range for type vector", pnstrdup(pt, stringEnd - pt))));
+			/* Check for range error like float4in */
+			if (errno == ERANGE && isinf(val))
+				ereport(ERROR,
+						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						 errmsg("\"%s\" is out of range for type vector", pnstrdup(pt, stringEnd - pt))));
 
-		CheckElement(val);
+			CheckElement(val);
+		}
+
 		x[dim++] = val;
 
 		pt = stringEnd;
@@ -276,9 +436,15 @@ vector_in(PG_FUNCTION_ARGS)
 	CheckDim(dim);
 	CheckExpectedDim(typmod, dim);
 
-	result = InitVector(dim);
-	for (int i = 0; i < dim; i++)
-		result->x[i] = x[i];
+	size = VECTOR_SIZE(dim);
+	result = (Vector *) palloc(size);
+	SET_VARSIZE(result, size);
+	result->dim = dim;
+	result->unused = 0;
+	memcpy(result->x, x, sizeof(float) * (Size) dim);
+
+	if (unlikely(x != x_stack))
+		pfree(x);
 
 	PG_RETURN_POINTER(result);
 }
