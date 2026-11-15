@@ -855,7 +855,7 @@ IvfflatBeginParallel(IvfflatBuildState * buildstate, bool isconcurrent, int requ
 	/* Enter parallel mode and create context */
 	EnterParallelMode();
 	Assert(request > 0);
-	pcxt = CreateParallelContext("vector", "IvfflatParallelBuildMain", request);
+	pcxt = CreateParallelContext("vectorfast", "IvfflatParallelBuildMain", request);
 
 	scantuplesortstates = leaderparticipates ? request + 1 : request;
 

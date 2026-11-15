@@ -946,7 +946,7 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 	/* Enter parallel mode and create context */
 	EnterParallelMode();
 	Assert(request > 0);
-	pcxt = CreateParallelContext("vector", "HnswParallelBuildMain", request);
+	pcxt = CreateParallelContext("vectorfast", "HnswParallelBuildMain", request);
 
 	/* Get snapshot for table scan */
 	if (!isconcurrent)
