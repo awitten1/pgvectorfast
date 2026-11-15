@@ -2,6 +2,11 @@
 #define IVFFLAT_H
 
 #include "postgres.h"
+#include "storage/lwlock.h"
+#include "storage/spin.h"
+#include "storage/condition_variable.h"
+#include "storage/bufpage.h"
+#include "varatt.h"
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -110,6 +115,7 @@ typedef Pointer Item;
 extern int	ivfflat_probes;
 extern int	ivfflat_iterative_scan;
 extern int	ivfflat_max_probes;
+extern int	ivfflat_topk_prune_limit;
 
 typedef enum IvfflatIterativeScanMode
 {
@@ -306,6 +312,8 @@ typedef struct IvfflatScanOpaqueData
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
 	Datum		(*distfunc) (FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2);
+	bool		topKPruneActive;
+	int			topKPruneLimit;
 
 	/* Lists */
 	pairingheap *listQueue;

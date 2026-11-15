@@ -2,6 +2,12 @@
 #define HNSW_H
 
 #include "postgres.h"
+#include "calico_internal.h"
+#include "storage/lwlock.h"
+#include "storage/spin.h"
+#include "storage/condition_variable.h"
+#include "storage/bufpage.h"
+#include "varatt.h"
 
 #include <math.h>
 
@@ -143,7 +149,7 @@ typedef Pointer Item;
 
 /* Pointer macros */
 #define HnswPtrAccess(base, hp) ((base) == NULL ? (hp).ptr : relptr_access(base, (hp).relptr))
-#define HnswPtrStore(base, hp, value) ((base) == NULL ? (void) ((hp).ptr = (value)) : (void) relptr_store(base, (hp).relptr, value))
+#define HnswPtrStore(base, hp, value) ((base) == NULL ? (void) ((hp).ptr = (value)) : (void) relptr_store(base, (hp).relptr, (__typeof__((hp).relptr.relptr_type)) (value)))
 #define HnswPtrIsNull(base, hp) ((base) == NULL ? (hp).ptr == NULL : relptr_is_null((hp).relptr))
 #define HnswPtrEqual(base, hp1, hp2) ((base) == NULL ? (hp1).ptr == (hp2).ptr : relptr_offset((hp1).relptr) == relptr_offset((hp2).relptr))
 
@@ -156,6 +162,7 @@ extern int	hnsw_ef_search;
 extern int	hnsw_iterative_scan;
 extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
+extern bool	hnsw_enable_prefetch;
 extern int	hnsw_lock_tranche_id;
 
 typedef enum HnswIterativeScanMode
@@ -301,6 +308,7 @@ typedef struct HnswSupport
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
+	CalicoReadHandle read_handle;
 }			HnswSupport;
 
 typedef struct HnswQuery
@@ -483,7 +491,7 @@ void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Rela
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
-bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
+bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, HnswSupport * support, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
 void		HnswCheckDim(int expected, const HnswTypeInfo * typeInfo, Oid collation, Datum value);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);

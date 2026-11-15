@@ -356,7 +356,7 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
 	ItemPointerData indextids[HNSW_MAX_M * 2];
 
-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
+	if (!HnswLoadNeighborTids(element, indextids, index, NULL, m, lm, lc))
 		return neighbors;
 
 	for (int i = 0; i < lm; i++)

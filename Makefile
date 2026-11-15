@@ -1,15 +1,18 @@
-EXTENSION = vector
+srcdir ?= $(patsubst %/,%,$(dir $(firstword $(MAKEFILE_LIST))))
+
+EXTENSION = vector calico
 EXTVERSION = 0.8.7
 
 MODULE_big = vector
-DATA = $(wildcard sql/*--*--*.sql)
-DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
-OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+DATA = $(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/sql/*--*--*.sql))
+DATA_built = sql/vector--$(EXTVERSION).sql
+DATA += sql/calico--0.1.sql
+OBJS = src/calico.o src/calico_pool.o src/calico_lifecycle.o src/calico_intercept.o src/calico_bufmgr.o src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
-TESTS = $(wildcard test/sql/*.sql)
-REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
-REGRESS_OPTS = --inputdir=test --load-extension=$(EXTENSION)
+TESTS = $(wildcard $(srcdir)/test/sql/*.sql)
+REGRESS = $(notdir $(TESTS:.sql=))
+REGRESS_OPTS = --inputdir=$(srcdir)/test --load-extension=vector
 
 # To compile for portability, run: make OPTFLAGS=""
 OPTFLAGS = -march=native
@@ -43,14 +46,61 @@ PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -
 # Debug Clang auto-vectorization
 # PG_CFLAGS += -Rpass=loop-vectorize -Rpass-analysis=loop-vectorize
 
-all: sql/$(EXTENSION)--$(EXTVERSION).sql
+all: sql/vector--$(EXTVERSION).sql
 
-sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql
+sql/vector--$(EXTVERSION).sql: sql/vector.sql
 	cp $< $@
 
 PG_CONFIG ?= pg_config
+PG_MAJOR_CALICO := $(shell $(PG_CONFIG) --version | sed -E 's/.* ([0-9]+).*/\1/')
+ifndef CAPSTONE_PREFIX
+ifneq ($(wildcard /usr/local/include/capstone/capstone.h),)
+CAPSTONE_PREFIX := /usr/local
+else ifneq ($(wildcard /usr/include/capstone/capstone.h),)
+CAPSTONE_PREFIX := /usr
+else
+CAPSTONE_DEPS_DIR := $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/pgvectorfast/python-deps
+CAPSTONE_PREFIX := $(CAPSTONE_DEPS_DIR)/capstone
+endif
+endif
+PG_CPPFLAGS += -I$(srcdir)/src
+ifneq ($(CAPSTONE_PREFIX),/usr)
+PG_CPPFLAGS += -I$(CAPSTONE_PREFIX)/include
+SHLIB_LINK += -L$(CAPSTONE_PREFIX)/lib -Wl,-rpath,$(CAPSTONE_PREFIX)/lib
+endif
+PG_CFLAGS += -fcf-protection=branch -Werror=implicit-function-declaration
+SHLIB_LINK += -lcapstone -ldl
+
+ifneq ($(CAPSTONE_DEPS_DIR),)
+CAPSTONE_HEADER := $(CAPSTONE_PREFIX)/include/capstone/capstone.h
+CAPSTONE_SOLINK := $(CAPSTONE_PREFIX)/lib/libcapstone.so.5
+ifeq ($(filter clean distclean maintainer-clean uninstall,$(MAKECMDGOALS)),)
+ifeq ($(if $(and $(wildcard $(MODULE_big)$(DLSUFFIX)),$(filter install installdirs,$(MAKECMDGOALS)),$(if $(filter-out install installdirs,$(MAKECMDGOALS)),,skip)),skip),)
+$(CAPSTONE_HEADER):
+	mkdir -p "$(CAPSTONE_DEPS_DIR)"
+	python3 -m pip install --only-binary=:all: --target "$(CAPSTONE_DEPS_DIR)" capstone==5.0.6
+
+$(CAPSTONE_SOLINK): $(CAPSTONE_HEADER)
+	@if [ ! -e "$@" ] && [ -e "$(CAPSTONE_PREFIX)/lib/libcapstone.so" ]; then \
+		ln -sf libcapstone.so "$@"; \
+	fi
+
+$(OBJS): | $(CAPSTONE_HEADER) $(CAPSTONE_SOLINK)
+endif
+endif
+endif
+
+$(OBJS): $(srcdir)/src/calico_internal.h $(srcdir)/Makefile
+src/calico_bufmgr.o src/calico_bufmgr.bc: $(srcdir)/src/calico_bufmgr$(PG_MAJOR_CALICO).inc
+
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Copied PostgreSQL routines keep the server's arithmetic/compiler semantics.
+# Vector-specific SIMD/fast-math flags above apply to pgvector's own sources.
+# PIC/visibility and CET are required by the extension's integration boundary.
+CALICO_CORE_CFLAGS ?= $(shell $(PG_CONFIG) --cflags) $(OPTFLAGS)
+src/calico.o src/calico_pool.o src/calico_lifecycle.o src/calico_intercept.o src/calico_bufmgr.o: override CFLAGS = $(CALICO_CORE_CFLAGS) $(CFLAGS_SL) $(CFLAGS_SL_MODULE) -fcf-protection=branch -Werror=implicit-function-declaration
 
 # for Mac
 ifeq ($(PROVE),)
@@ -68,22 +118,4 @@ prove_installcheck:
 
 dist:
 	mkdir -p dist
-	git archive --format zip --prefix=$(EXTENSION)-$(EXTVERSION)/ --output dist/$(EXTENSION)-$(EXTVERSION).zip master
-
-# for Docker
-PG_MAJOR ?= 17
-
-.PHONY: docker
-
-docker:
-	docker build --pull --no-cache --build-arg PG_MAJOR=$(PG_MAJOR) -t pgvector/pgvector:pg$(PG_MAJOR) -t pgvector/pgvector:$(EXTVERSION)-pg$(PG_MAJOR) .
-
-.PHONY: docker-release
-
-docker-release:
-	docker buildx build --push --pull --no-cache --platform linux/amd64,linux/arm64 --build-arg PG_MAJOR=$(PG_MAJOR) --build-arg DEBIAN_CODENAME=bookworm -t pgvector/pgvector:pg$(PG_MAJOR) -t pgvector/pgvector:pg$(PG_MAJOR)-bookworm -t pgvector/pgvector:$(EXTVERSION)-pg$(PG_MAJOR) -t pgvector/pgvector:$(EXTVERSION)-pg$(PG_MAJOR)-bookworm .
-
-.PHONY: docker-release-trixie
-
-docker-release-trixie:
-	docker buildx build --push --pull --no-cache --platform linux/amd64,linux/arm64 --build-arg PG_MAJOR=$(PG_MAJOR) --build-arg DEBIAN_CODENAME=trixie -t pgvector/pgvector:pg$(PG_MAJOR)-trixie -t pgvector/pgvector:$(EXTVERSION)-pg$(PG_MAJOR)-trixie .
+	git archive --format zip --prefix=pgvectorfast-$(EXTVERSION)/ --output dist/pgvectorfast-$(EXTVERSION).zip HEAD

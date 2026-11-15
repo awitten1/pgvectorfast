@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include "calico_internal.h"
 
 #include <math.h>
 
@@ -58,6 +59,7 @@ PGDLLEXPORT void _PG_init(void);
 void
 _PG_init(void)
 {
+	CalicoInit();
 	BitvecInit();
 	HalfvecInit();
 	HnswInit();
@@ -70,10 +72,9 @@ _PG_init(void)
 static inline void
 CheckDims(Vector * a, Vector * b)
 {
-	if (a->dim != b->dim)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("different vector dimensions %d and %d", a->dim, b->dim)));
+    if (a->dim != b->dim)
+        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("different vector dimensions %d and %d", a->dim, b->dim)));
 }
 
 /*

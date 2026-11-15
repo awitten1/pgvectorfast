@@ -1,0 +1,6 @@
+comment = 'Calico array translation for PostgreSQL shared buffers'
+default_version = '0.1'
+module_pathname = '$libdir/vector'
+relocatable = false
+schema = 'calico'
+superuser = true
