@@ -18,6 +18,7 @@ extern Datum vector_l2_squared_distance(PG_FUNCTION_ARGS);
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/memdebug.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "vector.h"
 #include "vector_simd.h"
@@ -899,14 +900,305 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, 
 	return 0;
 }
 
+#define HNSW_BACKEND_VISITED_MAX_CAP (131072U)	/* 1 MB retained per backend */
+
+typedef struct HnswBackendVisitedCache
+{
+	uint64	   *slots;
+	uint32		cap;
+	uint16		gen;
+	bool		in_use;
+}			HnswBackendVisitedCache;
+
+static HnswBackendVisitedCache hnsw_backend_visited = {NULL, 0, 0, false};
+
+static void
+HnswReleaseBackendVisitedCb(void *arg)
+{
+	hnsw_backend_visited.in_use = false;
+}
+
+void
+HnswAcquireScanVisited(HnswFastVisited *fv, MemoryContext scanCtx, MemoryContext tmpCtx,
+					   MemoryContextCallback *cb, bool *cbRegistered)
+{
+	fv->alloc_ctx = scanCtx;
+	fv->count = 0;
+
+	/*
+	 * Nested/concurrent scans retain their own allocation across rescans
+	 * instead of clobbering it.
+	 */
+	if (fv->slots != NULL && !fv->is_backend_cache)
+		return;
+
+	if (!hnsw_backend_visited.in_use)
+	{
+		hnsw_backend_visited.in_use = true;
+		fv->is_backend_cache = true;
+		fv->on_stack = false;
+		fv->slots = hnsw_backend_visited.slots;
+		fv->mask = hnsw_backend_visited.cap > 0 ? hnsw_backend_visited.cap - 1 : 0;
+		fv->grow_at = (hnsw_backend_visited.cap * 3) / 4;
+		fv->gen = hnsw_backend_visited.gen;
+
+		if (!*cbRegistered)
+		{
+			cb->func = HnswReleaseBackendVisitedCb;
+			cb->arg = NULL;
+			MemoryContextRegisterResetCallback(tmpCtx, cb);
+			*cbRegistered = true;
+		}
+	}
+	else if (fv->is_backend_cache)
+	{
+		fv->is_backend_cache = false;
+		fv->slots = NULL;
+		fv->mask = 0;
+		fv->grow_at = 0;
+		fv->gen = 0;
+	}
+}
+
+void
+HnswReleaseScanVisited(HnswFastVisited *fv)
+{
+	if (fv->is_backend_cache)
+	{
+		hnsw_backend_visited.in_use = false;
+		fv->slots = NULL;
+		fv->is_backend_cache = false;
+	}
+	else if (fv->slots != NULL && !fv->on_stack)
+	{
+		pfree(fv->slots);
+		fv->slots = NULL;
+	}
+	fv->mask = 0;
+	fv->count = 0;
+	fv->grow_at = 0;
+}
+
+static inline uint32
+hnsw_next_pow2_u32(uint32 v)
+{
+	uint32		cap = 128;
+
+	while (cap < v && cap < (1U << 24))
+		cap <<= 1;
+	return cap;
+}
+
+static pg_noinline void
+hnsw_fast_visited_grow(HnswFastVisited *fv, uint32 extra)
+{
+	uint32		old_cap = fv->mask + 1;
+	uint32		new_cap = old_cap << 1;
+	uint64	   *new_slots;
+	uint64	   *old_slots = fv->slots;
+	uint32		new_mask;
+	uint16		gen = fv->gen;
+	bool		was_backend_cache = fv->is_backend_cache;
+	MemoryContext ctx;
+
+	while ((new_cap * 3) / 4 < fv->count + extra && new_cap < (1U << 26))
+		new_cap <<= 1;
+
+	if (fv->is_backend_cache && new_cap <= HNSW_BACKEND_VISITED_MAX_CAP)
+		ctx = TopMemoryContext;
+	else
+	{
+		if (fv->is_backend_cache)
+		{
+			fv->is_backend_cache = false;
+			hnsw_backend_visited.in_use = false;
+		}
+		ctx = fv->alloc_ctx != NULL ? fv->alloc_ctx : CurrentMemoryContext;
+		fv->alloc_ctx = ctx;
+	}
+
+	new_slots = (uint64 *) MemoryContextAllocZero(ctx, (Size) new_cap * sizeof(uint64));
+	new_mask = new_cap - 1;
+
+	for (uint32 i = 0; i < old_cap; i++)
+	{
+		uint64		val = old_slots[i];
+
+		if ((uint16) (val >> 48) == gen)
+		{
+			uint64		tid48 = val & UINT64CONST(0x0000ffffffffffff);
+			uint32		pos = hnsw_hash_tid48(tid48) & new_mask;
+
+			while (new_slots[pos] != 0)
+				pos = (pos + 1) & new_mask;
+			new_slots[pos] = val;
+		}
+	}
+
+	fv->slots = new_slots;
+	fv->mask = new_mask;
+	fv->grow_at = (new_cap * 3) / 4;
+	fv->gen = gen;
+
+	if (fv->is_backend_cache)
+	{
+		hnsw_backend_visited.slots = new_slots;
+		hnsw_backend_visited.cap = new_cap;
+		hnsw_backend_visited.gen = gen;
+		fv->on_stack = false;
+		pfree(old_slots);
+	}
+	else if (!was_backend_cache && !fv->on_stack)
+		pfree(old_slots);
+	else
+		fv->on_stack = false;
+}
+
+static void
+hnsw_fast_visited_init(HnswFastVisited *fv, int ef, int m,
+					   uint64 *stack_buf, uint32 stack_cap)
+{
+	uint32		min_cap = (uint32) Max((Size) ef * m * 4, (Size) 128);
+	uint32		desired = hnsw_next_pow2_u32(min_cap);
+
+	if (fv->slots != NULL)
+	{
+		uint32		cur_cap = fv->mask + 1;
+
+		if (cur_cap >= desired)
+		{
+			fv->gen++;
+			if (unlikely(fv->gen == 0))
+			{
+				memset(fv->slots, 0, (Size) cur_cap * sizeof(uint64));
+				fv->gen = 1;
+			}
+			fv->count = 0;
+			if (fv->is_backend_cache)
+				hnsw_backend_visited.gen = fv->gen;
+			return;
+		}
+
+		if (fv->is_backend_cache)
+		{
+			if (desired <= HNSW_BACKEND_VISITED_MAX_CAP)
+			{
+				uint64	   *new_slots = (uint64 *) MemoryContextAllocZero(TopMemoryContext,
+																		(Size) desired * sizeof(uint64));
+				uint64	   *old_slots = fv->slots;
+
+				hnsw_backend_visited.slots = new_slots;
+				hnsw_backend_visited.cap = desired;
+				hnsw_backend_visited.gen = 1;
+				fv->slots = new_slots;
+				fv->mask = desired - 1;
+				fv->grow_at = (desired * 3) / 4;
+				fv->gen = 1;
+				fv->count = 0;
+				fv->on_stack = false;
+				pfree(old_slots);
+				return;
+			}
+			fv->is_backend_cache = false;
+			hnsw_backend_visited.in_use = false;
+		}
+		else if (!fv->on_stack)
+			pfree(fv->slots);
+
+		fv->slots = NULL;
+	}
+
+	if (stack_buf != NULL && stack_cap >= desired)
+	{
+		memset(stack_buf, 0, (Size) desired * sizeof(uint64));
+		fv->slots = stack_buf;
+		fv->mask = desired - 1;
+		fv->grow_at = (desired * 3) / 4;
+		fv->gen = 1;
+		fv->count = 0;
+		fv->on_stack = true;
+		fv->is_backend_cache = false;
+		if (fv->alloc_ctx == NULL)
+			fv->alloc_ctx = CurrentMemoryContext;
+		return;
+	}
+
+	if (fv->is_backend_cache)
+	{
+		if (desired <= HNSW_BACKEND_VISITED_MAX_CAP)
+		{
+			uint64	   *new_slots = (uint64 *) MemoryContextAllocZero(TopMemoryContext,
+																	(Size) desired * sizeof(uint64));
+
+			hnsw_backend_visited.slots = new_slots;
+			hnsw_backend_visited.cap = desired;
+			hnsw_backend_visited.gen = 1;
+			fv->slots = new_slots;
+			fv->mask = desired - 1;
+			fv->grow_at = (desired * 3) / 4;
+			fv->gen = 1;
+			fv->count = 0;
+			fv->on_stack = false;
+			return;
+		}
+		fv->is_backend_cache = false;
+		hnsw_backend_visited.in_use = false;
+	}
+
+	{
+		MemoryContext ctx = fv->alloc_ctx != NULL ? fv->alloc_ctx : CurrentMemoryContext;
+
+		fv->alloc_ctx = ctx;
+		fv->slots = (uint64 *) MemoryContextAllocZero(ctx, (Size) desired * sizeof(uint64));
+		fv->mask = desired - 1;
+		fv->grow_at = (desired * 3) / 4;
+		fv->gen = 1;
+		fv->count = 0;
+		fv->on_stack = false;
+	}
+}
+
+static inline bool
+hnsw_fast_visited_insert(HnswFastVisited *fv, BlockNumber blkno, OffsetNumber offno)
+{
+	uint64		tid48 = ((uint64) blkno << 16) | (uint64) offno;
+	uint64		target = ((uint64) fv->gen << 48) | tid48;
+	uint64	   *slots;
+	uint32		mask;
+	uint32		pos;
+
+	if (unlikely(fv->count >= fv->grow_at))
+		hnsw_fast_visited_grow(fv, 1);
+
+	slots = fv->slots;
+	mask = fv->mask;
+	pos = hnsw_hash_tid48(tid48) & mask;
+
+	for (;;)
+	{
+		uint64		cur = slots[pos];
+
+		if (cur == target)
+			return true;
+		if ((uint16) (cur >> 48) != fv->gen)
+		{
+			slots[pos] = target;
+			fv->count++;
+			return false;
+		}
+		pos = (pos + 1) & mask;
+	}
+}
+
 /*
  * Init visited
  */
 static inline void
-InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m)
+InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m,
+			uint64 *stack_buf, uint32 stack_cap)
 {
 	if (!inMemory)
-		v->tids = tidhash_create(CurrentMemoryContext, ef * m * 2, NULL);
+		hnsw_fast_visited_init(&v->tids, ef, m, stack_buf, stack_cap);
 	else if (base != NULL)
 		v->offsets = offsethash_create(CurrentMemoryContext, ef * m * 2, NULL);
 	else
@@ -922,10 +1214,8 @@ AddToVisited(char *base, visited_hash * v, HnswElementPtr elementPtr, bool inMem
 	if (!inMemory)
 	{
 		HnswElement element = HnswPtrAccess(base, elementPtr);
-		ItemPointerData indextid;
 
-		ItemPointerSet(&indextid, element->blkno, element->offno);
-		tidhash_insert(v->tids, indextid, found);
+		*found = hnsw_fast_visited_insert(&v->tids, element->blkno, element->offno);
 	}
 	else if (base != NULL)
 	{
@@ -1164,25 +1454,77 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 		use_prefetch = true;
 	}
 
-	/* First pass: identify unvisited neighbors */
-	for (int i = 0; i < lm; i++)
+	/* First pass: batch-prefetch & probe generation-stamped visited slots */
 	{
-		ItemPointer indextid = &indextids[i];
-		bool		found;
+		HnswFastVisited *fv = &v->tids;
+		uint64	   *slots;
+		uint32		mask;
+		uint64		gen_prefix;
+		uint16		gen;
+		uint64		tids48[HNSW_MAX_M * 2];
+		uint32		buckets[HNSW_MAX_M * 2];
+		int			n_tids = 0;
 
-		if (!ItemPointerIsValid(indextid))
-			break;
+		if (unlikely(fv->count + lm > fv->grow_at))
+			hnsw_fast_visited_grow(fv, (uint32) lm);
 
-		tidhash_insert(v->tids, *indextid, &found);
+		slots = fv->slots;
+		mask = fv->mask;
+		gen = fv->gen;
+		gen_prefix = (uint64) gen << 48;
 
-		if (!found)
+		for (int i = 0; i < lm; i++)
 		{
-			unvisited[*unvisitedLength].indextid = *indextid;
+			ItemPointer indextid = &indextids[i];
+			uint64		tid48;
+			uint32		pos;
 
-			if (use_prefetch)
-				batch_blocknums[*unvisitedLength] = ItemPointerGetBlockNumber(indextid);
+			if (!ItemPointerIsValid(indextid))
+				break;
 
-			(*unvisitedLength)++;
+			tid48 = ((uint64) BlockIdGetBlockNumber(&indextid->ip_blkid) << 16) |
+				(uint64) indextid->ip_posid;
+			pos = hnsw_hash_tid48(tid48) & mask;
+			tids48[n_tids] = tid48;
+			buckets[n_tids] = pos;
+			__builtin_prefetch(&slots[pos], 0, 3);
+			n_tids++;
+		}
+
+		for (int i = 0; i < n_tids; i++)
+		{
+			uint64		tid48 = tids48[i];
+			uint64		target = gen_prefix | tid48;
+			uint32		pos = buckets[i];
+			bool		found = false;
+
+			for (;;)
+			{
+				uint64		cur = slots[pos];
+
+				if (cur == target)
+				{
+					found = true;
+					break;
+				}
+				if ((uint16) (cur >> 48) != gen)
+				{
+					slots[pos] = target;
+					fv->count++;
+					break;
+				}
+				pos = (pos + 1) & mask;
+			}
+
+			if (!found)
+			{
+				unvisited[*unvisitedLength].indextid = indextids[i];
+
+				if (use_prefetch)
+					batch_blocknums[*unvisitedLength] = (BlockNumber) (tid48 >> 16);
+
+				(*unvisitedLength)++;
+			}
 		}
 	}
 
@@ -1317,6 +1659,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	const Vector *queryVec = NULL;
 	Size		optVecSize = 0;
 	Size		optPrefetchBytes = 0;
+	uint64		stack_visited_buf[128];
+	bool		use_local_v = (v == NULL);
 
 	if (!inMemory && !inserting && calico_enable_optimistic_reads &&
 		support != NULL &&
@@ -1349,15 +1693,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		optPrefetchBytes = sizeof(HnswElementTupleData) + 64;
 	}
 
-	if (v == NULL)
+	if (use_local_v)
 	{
+		memset(&vh, 0, sizeof(vh));
 		v = &vh;
 		initVisited = true;
 	}
 
 	if (initVisited)
 	{
-		InitVisited(base, v, inMemory, ef, m);
+		InitVisited(base, v, inMemory, ef, m,
+					(use_local_v && !inMemory) ? stack_visited_buf : NULL,
+					(use_local_v && !inMemory) ? lengthof(stack_visited_buf) : 0);
 
 		if (discarded != NULL)
 			*discarded = pairingheap_allocate(CompareNearestDiscardedCandidates, NULL);
@@ -1504,6 +1851,12 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		}
+	}
+
+	if (use_local_v && !inMemory && vh.tids.slots != NULL && !vh.tids.on_stack)
+	{
+		pfree(vh.tids.slots);
+		vh.tids.slots = NULL;
 	}
 
 	/* Add each element of W to w */

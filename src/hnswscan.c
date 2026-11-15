@@ -141,7 +141,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
 
-	so = palloc_object(HnswScanOpaqueData);
+	so = palloc0_object(HnswScanOpaqueData);
 	so->typeInfo = HnswGetTypeInfo(index);
 
 	/* Set support functions */
@@ -154,6 +154,9 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 									   "Hnsw scan temporary context",
 									   0, 8 * 1024, 256 * 1024);
+
+	HnswAcquireScanVisited(&so->v.tids, CurrentMemoryContext, so->tmpCtx,
+						   &so->visited_cb, &so->visited_cb_registered);
 
 	/* Calculate max memory */
 	/* Add 256 extra bytes to fill last block when close */
@@ -174,12 +177,15 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 
 	so->first = true;
-	/* v and discarded are allocated in tmpCtx */
-	so->v.tids = NULL;
+	/* v's visited slots persist across rescans; discarded is allocated in tmpCtx */
+	so->v.tids.count = 0;
 	so->discarded = NULL;
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
+	so->visited_cb_registered = false;
+	HnswAcquireScanVisited(&so->v.tids, CurrentMemoryContext, so->tmpCtx,
+						   &so->visited_cb, &so->visited_cb_registered);
 
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
@@ -344,6 +350,7 @@ hnswendscan(IndexScanDesc scan)
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 
 	MemoryContextDelete(so->tmpCtx);
+	HnswReleaseScanVisited(&so->v.tids);
 
 	pfree(so);
 	scan->opaque = NULL;

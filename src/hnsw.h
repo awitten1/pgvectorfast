@@ -402,11 +402,32 @@ typedef struct HnswNeighborTupleData
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
 
+typedef struct HnswFastVisited
+{
+	uint64	   *slots;
+	uint32		mask;			/* capacity - 1 (power of 2), 0 if uninitialized */
+	uint32		count;			/* entries inserted in current generation */
+	uint32		grow_at;		/* resize threshold */
+	MemoryContext alloc_ctx;	/* context owning heap slots */
+	uint16		gen;			/* active 16-bit generation tag (1..65535) */
+	bool		on_stack;		/* true if slots points to stack buffer */
+	bool		is_backend_cache;	/* true if slots points to backend cache */
+}			HnswFastVisited;
+
+static inline uint32
+hnsw_hash_tid48(uint64 tid48)
+{
+	uint64		h = tid48 ^ (tid48 >> 25);
+
+	h *= UINT64CONST(0xbf58476d1ce4e5b9);
+	return (uint32) (h ^ (h >> 31));
+}
+
 typedef union
 {
 	struct pointerhash_hash *pointers;
 	struct offsethash_hash *offsets;
-	struct tidhash_hash *tids;
+	HnswFastVisited tids;
 }			visited_hash;
 
 typedef union
@@ -421,6 +442,8 @@ typedef struct HnswScanOpaqueData
 	bool		first;
 	List	   *w;
 	visited_hash v;
+	bool		visited_cb_registered;
+	MemoryContextCallback visited_cb;
 	pairingheap *discarded;
 	HnswQuery	q;
 	int			m;
@@ -471,6 +494,8 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
+void		HnswAcquireScanVisited(HnswFastVisited *fv, MemoryContext scanCtx, MemoryContext tmpCtx, MemoryContextCallback *cb, bool *cbRegistered);
+void		HnswReleaseScanVisited(HnswFastVisited *fv);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint);
