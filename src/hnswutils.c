@@ -645,6 +645,65 @@ HnswLoadElementFromTupleOptimistic(HnswElement element, HnswElementTuple etup,
 }
 
 /*
+ * Try loading and/or scoring an element optimistically from a resolved slot.
+ * Precondition: optimistic L2 path is enabled and !loadVec.
+ */
+static inline bool
+HnswLoadElementOptimisticSlot(BlockNumber blkno, OffsetNumber offno,
+							  const CalicoOptimisticSlot *slot,
+							  double *distance, const Vector *a_vec,
+							  Size vec_size, double *maxDistance,
+							  HnswElement *element)
+{
+	Page		page;
+	HnswElementTuple etup;
+	bool		was_element_null;
+	bool		should_load;
+	bool		validation_passed;
+
+	if (unlikely(slot == NULL || !slot->opt_valid || slot->entry_ptr == NULL))
+		return false;
+
+	page = BufferGetPage(slot->frame_id + 1);
+	was_element_null = (*element == NULL);
+
+	if (distance != NULL && a_vec != NULL)
+	{
+		etup = HnswOptimisticItem(page, offno,
+								  offsetof(HnswElementTupleData, data) + vec_size);
+		if (unlikely(etup == NULL || etup->deleted))
+			return false;
+		if (unlikely(!HnswGetDistanceOptimistic(a_vec, &etup->data, vec_size, distance)))
+			return false;
+	}
+	else
+	{
+		etup = HnswOptimisticItem(page, offno, offsetof(HnswElementTupleData, data));
+		if (unlikely(etup == NULL || etup->deleted))
+			return false;
+		if (distance != NULL)
+			*distance = 0;
+	}
+
+	should_load = (distance == NULL || maxDistance == NULL || *distance < *maxDistance);
+	if (should_load)
+	{
+		if (*element == NULL)
+			*element = HnswInitElementFromBlock(blkno, offno);
+		HnswLoadElementFromTuple(*element, etup, true, false);
+	}
+
+	validation_passed = calico_optimistic_validate(slot->entry_ptr, slot->version);
+	if (likely(validation_passed))
+		return true;
+
+	if (should_load && was_element_null)
+		*element = NULL;
+
+	return false;
+}
+
+/*
  * Load an element and optionally get its distance from q
  */
 static void
@@ -653,8 +712,6 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	Buffer		buf;
 	Page		page;
 	HnswElementTuple etup;
-	bool		found;
-	uint64		version;
 
 	/*
 	 * Try optimistic read path if enabled and buffer manager supports it.
@@ -664,10 +721,22 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	    support->procinfo->fn_addr == vector_l2_squared_distance &&
 	    calico_is_active() && !RelationUsesLocalBuffers(index))
 	{
-		uint32 buf_id = 0;
-		void *entry_ptr = NULL;
-		bool validation_passed = false;
-		bool was_element_null = (*element == NULL);
+		const Vector *a_vec = (const Vector *) DatumGetPointer(q->value);
+		Size		vec_size = 0;
+		bool		found = false;
+		uint64		version = 0;
+		uint32		buf_id = 0;
+		void	   *entry_ptr = NULL;
+
+		if (distance != NULL && a_vec != NULL)
+		{
+			if (unlikely(a_vec->dim <= 0))
+				goto optimistic_element_failed;
+			vec_size = VECTOR_SIZE(a_vec->dim);
+			if (unlikely(vec_size > BLCKSZ - offsetof(HnswElementTupleData, data)))
+				goto optimistic_element_failed;
+		}
+
 		/* Reuse this operation's translation region; validate every read. */
 		calico_optimistic_lookup_handle(
 			&support->read_handle,
@@ -677,110 +746,21 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 			&buf_id,
 			&entry_ptr
 		);
-		
+
 		if (found)
 		{
-			/* 
-			 * CRITICAL: All reads must happen BEFORE validation check.
-			 * After validation fails, the page may be evicted or modified.
-			 */
-			
-			/* Read shared_buffer page data optimistically */
-			page = BufferGetPage(buf_id + 1);
-			//ItemIdData item_id_data = *PageGetItemId(page, offno);
-			bool should_load = false;
-			// validate item_id_data is wihtin bound of page
-			// if (ItemIdGetLength(&item_id_data) <= 0 ||
-			//     ItemIdGetOffset(&item_id_data) < SizeOfPageHeaderData ||
-			//     (ItemIdGetOffset(&item_id_data) + ItemIdGetLength(&item_id_data)) >= BLCKSZ)
-			// {
-			// 	/* Invalid item_id_data - will be caught by validation */
-			// 	validation_passed = false;
-			// } else {
-				/* Safe to validate tuple bounds and compute distance cleanly. */
-				if (distance != NULL && DatumGetPointer(q->value) != NULL)
-				{
-					const Vector *a_vec = (const Vector *) DatumGetPointer(q->value);
-					Size		vec_size;
+			CalicoOptimisticSlot slot;
 
-					if (unlikely(a_vec->dim <= 0))
-						goto optimistic_element_failed;
-					vec_size = VECTOR_SIZE(a_vec->dim);
-					if (unlikely(vec_size > BLCKSZ - offsetof(HnswElementTupleData, data)))
-						goto optimistic_element_failed;
-					etup = HnswOptimisticItem(page, offno,
-											  offsetof(HnswElementTupleData, data) + vec_size);
-					if (etup == NULL || unlikely(etup->deleted))
-						goto optimistic_element_failed;
-					if (!HnswGetDistanceOptimistic(a_vec, &etup->data, vec_size, distance))
-						goto optimistic_element_failed;
-				}
-				else
-				{
-					etup = HnswOptimisticItem(page, offno, offsetof(HnswElementTupleData, data));
-					if (etup == NULL || unlikely(etup->deleted))
-						goto optimistic_element_failed;
-					if (distance != NULL)
-						*distance = 0;
-				}
-				
-				/* Check if we should load element data */
-				should_load = (distance == NULL || maxDistance == NULL || 
-									*distance < *maxDistance);
-				
-				if (should_load)
-				{
-					// /* Allocate element if needed */
-					if (*element == NULL)
-						*element = HnswInitElementFromBlock(blkno, offno);
-					
-					// // /* Load element data using safe optimistic method with page bounds check */
-					// // HnswLoadElementFromTupleOptimistic(*element, etup, true, loadVec, page);
-					// // //HnswLoadElementFromTuple(*element, etup, true, loadVec);
-					if (loadVec) {
-						validation_passed = false; // Force validation failure
-					} else {
-						HnswLoadElementFromTuple(*element, etup, true, false);
-						validation_passed = calico_optimistic_validate(entry_ptr, version);
-					}
-					
-				} else {
-					validation_passed = calico_optimistic_validate(entry_ptr, version);
-				}
-			//}
-			/*
-			 * NOW validate the optimistic read.
-			 * This MUST be the last operation before returning.
-			 */
-			// if (validation_passed == false)
-			// 	validation_passed = CalicoLookupAndOptimisticValidate(entry_ptr, version);
-			
-			if (validation_passed)
-			{
-				/* SUCCESS: All data read is consistent */
+			slot.entry_ptr = (CalicoTranslationEntry *) entry_ptr;
+			slot.version = version;
+			slot.frame_id = buf_id;
+			slot.resident = true;
+			slot.opt_valid = true;
+
+			if (HnswLoadElementOptimisticSlot(blkno, offno, &slot,
+											  distance, a_vec, vec_size,
+											  maxDistance, element))
 				return;
-			}
-			
-			/*
-			 * VALIDATION FAILED
-			 * 
-			 * All data we read may be corrupted. We must:
-			 * 1. Free any allocated memory (element->value from loadVec)
-			 * 2. Reset element to pre-read state
-			 * 3. Fall through to locked path
-			 */
-			
-			if (should_load && *element != NULL)
-			{
-				// restore *element
-				// No need to free memory because memory context will clean up the allocated objects at once at the end
-				if (was_element_null)
-				{
-					*element = NULL;
-				}
-			}
-			
-			/* Fall through to locked path */
 		}
 optimistic_element_failed:
 		calico_optimistic_element_fallbacks++;
@@ -1119,31 +1099,59 @@ optimistic_neighbor_failed:
 	return true;
 }
 
-/* Structure for caching prefetch info (16 bytes) */
-typedef struct HnswPrefetchCache
+#define HNSW_PREFETCH_AHEAD 3
+
+/*
+ * Prefetch all relevant cachelines of a neighbor's tuple (header + vector)
+ * within page bounds from a resolved optimistic slot.
+ */
+static inline void
+HnswPrefetchSlotTuple(const CalicoOptimisticSlot *slot, OffsetNumber offno, Size tuple_bytes)
 {
 	Page		page;
-	ItemId		itemid;
-} HnswPrefetchCache;
+	ItemIdData	item;
+	unsigned	offset;
+	unsigned	length;
+	const char *p;
+	Size		limit;
+	Size		off;
+
+	if (!slot->opt_valid)
+		return;
+	if (unlikely(offno < FirstOffsetNumber ||
+				 offno > (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
+		return;
+
+	page = BufferGetPage(slot->frame_id + 1);
+	item = *(volatile ItemIdData *) PageGetItemId(page, offno);
+	if (unlikely(!ItemIdIsNormal(&item)))
+		return;
+
+	offset = ItemIdGetOffset(&item);
+	length = ItemIdGetLength(&item);
+	if (unlikely(offset < SizeOfPageHeaderData ||
+				 length < sizeof(HnswElementTupleData) ||
+				 offset + length > BLCKSZ))
+		return;
+
+	limit = Min(tuple_bytes, (Size) length);
+	p = (const char *) page + offset;
+	for (off = 0; off < limit; off += 64)
+		__builtin_prefetch(p + off, 0, 3);
+}
 
 /*
  * Load unvisited neighbors from disk
- * Returns prefetch_cache and prefetch_count as output parameters for caller to issue vector data prefetch
+ * Populates slots_out (aligned 1-to-1 with unvisited[]) for downstream optimistic access and prefetching.
  */
 static void
-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, HnswSupport * support, int m, int lm, int lc, HnswPrefetchCache *prefetch_cache_out, int *prefetch_count_out)
+HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, HnswSupport * support, int m, int lm, int lc, CalicoOptimisticSlot *slots_out, Size tuple_prefetch_bytes)
 {
 	ItemPointerData indextids[HNSW_MAX_M * 2];
 	bool		use_prefetch = false;
-	
-	/* Arrays for batch lookup */
 	BlockNumber batch_blocknums[HNSW_MAX_M * 2];
-	uint32		batch_frameids[HNSW_MAX_M * 2];
-	bool		batch_found[HNSW_MAX_M * 2];
-	int			batch_start = 0;  /* Track where current batch starts in unvisited array */
 
 	*unvisitedLength = 0;
-	*prefetch_count_out = 0;
 
 	if (!HnswLoadNeighborTids(element, indextids, index, support, m, lm, lc))
 		return;
@@ -1156,7 +1164,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 		use_prefetch = true;
 	}
 
-	/* First pass: identify unvisited neighbors and issue batch prefetches when we reach BATCH_SIZE */
+	/* First pass: identify unvisited neighbors */
 	for (int i = 0; i < lm; i++)
 	{
 		ItemPointer indextid = &indextids[i];
@@ -1170,154 +1178,61 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 		if (!found)
 		{
 			unvisited[*unvisitedLength].indextid = *indextid;
-			
-			/* Collect block number for batch prefetch */
+
 			if (use_prefetch)
 				batch_blocknums[*unvisitedLength] = ItemPointerGetBlockNumber(indextid);
-			
+
 			(*unvisitedLength)++;
 		}
 	}
 
-	/* Handle remaining items (less than BATCH_SIZE) */
-	if (use_prefetch && *unvisitedLength > batch_start)
+	if (use_prefetch && *unvisitedLength > 0)
 	{
-		int			batch_count = *unvisitedLength - batch_start;
+		int			count = *unvisitedLength;
 		BlockNumber missing_blocks[HNSW_MAX_M * 2];
 		int			missing_count = 0;
-		int			prefetch_count = 0;
 
 		if (support != NULL)
-			calico_optimistic_lookup_batch_handle(&support->read_handle,
-												  &batch_blocknums[batch_start],
-												  batch_count,
-												  &batch_frameids[batch_start],
-												  &batch_found[batch_start]);
+			calico_optimistic_lookup_batch_slots(&support->read_handle,
+												 batch_blocknums,
+												 count,
+												 slots_out);
 		else
+		{
+			uint32		batch_frameids[HNSW_MAX_M * 2];
+			bool		batch_found[HNSW_MAX_M * 2];
+
 			CalicoLookupAndOptimisticPinBatch(RelationGetSmgr(index),
 											  MAIN_FORKNUM,
-											  &batch_blocknums[batch_start],
-											  batch_count,
-											  &batch_frameids[batch_start],
-											  &batch_found[batch_start]);
-
-		/* Process results and issue prefetches with loop unrolling for better MLP */
-		int j = batch_start;
-		
-		/* Process 4 items at a time for better ILP/MLP */
-		for (; j + 3 < *unvisitedLength; j += 4)
-		{
-			Page		prefetch_page0 = NULL, prefetch_page1 = NULL, prefetch_page2 = NULL, prefetch_page3 = NULL;
-			ItemId		itemid0 = NULL, itemid1 = NULL, itemid2 = NULL, itemid3 = NULL;
-			bool		found0, found1, found2, found3;
-			
-			/* Load all found flags */
-			found0 = batch_found[j];
-			found1 = batch_found[j + 1];
-			found2 = batch_found[j + 2];
-			found3 = batch_found[j + 3];
-			
-			/* Collect missing blocks for async I/O */
-			if (!found0)
-				missing_blocks[missing_count++] = batch_blocknums[j];
-			if (!found1)
-				missing_blocks[missing_count++] = batch_blocknums[j + 1];
-			if (!found2)
-				missing_blocks[missing_count++] = batch_blocknums[j + 2];
-			if (!found3)
-				missing_blocks[missing_count++] = batch_blocknums[j + 3];
-			
-			/* Get pages for all 4 items - these loads can happen in parallel */
-			if (found0)
+											  batch_blocknums,
+											  count,
+											  batch_frameids,
+											  batch_found);
+			for (int j = 0; j < count; j++)
 			{
-				ItemPointer tid0 = &unvisited[j].indextid;
-
-				prefetch_page0 = BufferGetPage(batch_frameids[j] + 1);
-				itemid0 = PageGetItemId(prefetch_page0, ItemPointerGetOffsetNumber(tid0));
-			}
-			if (found1)
-			{
-				ItemPointer tid1 = &unvisited[j + 1].indextid;
-
-				prefetch_page1 = BufferGetPage(batch_frameids[j + 1] + 1);
-				itemid1 = PageGetItemId(prefetch_page1, ItemPointerGetOffsetNumber(tid1));
-			}
-			if (found2)
-			{
-				ItemPointer tid2 = &unvisited[j + 2].indextid;
-
-				prefetch_page2 = BufferGetPage(batch_frameids[j + 2] + 1);
-				itemid2 = PageGetItemId(prefetch_page2, ItemPointerGetOffsetNumber(tid2));
-			}
-			if (found3)
-			{
-				ItemPointer tid3 = &unvisited[j + 3].indextid;
-
-				prefetch_page3 = BufferGetPage(batch_frameids[j + 3] + 1);
-				itemid3 = PageGetItemId(prefetch_page3, ItemPointerGetOffsetNumber(tid3));
-			}
-			
-			/* Cache and prefetch - issue all prefetches together for MLP */
-			if (found0)
-			{
-				prefetch_cache_out[prefetch_count].page = prefetch_page0;
-				prefetch_cache_out[prefetch_count].itemid = itemid0;
-				prefetch_count++;
-				__builtin_prefetch(itemid0, 0, 3);
-			}
-			if (found1)
-			{
-				prefetch_cache_out[prefetch_count].page = prefetch_page1;
-				prefetch_cache_out[prefetch_count].itemid = itemid1;
-				prefetch_count++;
-				__builtin_prefetch(itemid1, 0, 3);
-			}
-			if (found2)
-			{
-				prefetch_cache_out[prefetch_count].page = prefetch_page2;
-				prefetch_cache_out[prefetch_count].itemid = itemid2;
-				prefetch_count++;
-				__builtin_prefetch(itemid2, 0, 3);
-			}
-			if (found3)
-			{
-				prefetch_cache_out[prefetch_count].page = prefetch_page3;
-				prefetch_cache_out[prefetch_count].itemid = itemid3;
-				prefetch_count++;
-				__builtin_prefetch(itemid3, 0, 3);
+				slots_out[j].entry_ptr = NULL;
+				slots_out[j].version = 0;
+				slots_out[j].frame_id = batch_frameids[j];
+				slots_out[j].resident = batch_found[j];
+				slots_out[j].opt_valid = false;
 			}
 		}
-		
-		/* Handle remaining items */
-		for (; j < *unvisitedLength; j++)
+
+		for (int j = 0; j < count; j++)
 		{
-			if (batch_found[j])
+			if (slots_out[j].resident)
 			{
-				Page		prefetch_page;
-				ItemId		itemid;
-				ItemPointer tid = &unvisited[j].indextid;
-				
-				/* Get the page and ItemId */
-				prefetch_page = BufferGetPage(batch_frameids[j] + 1);
-				itemid = PageGetItemId(prefetch_page, ItemPointerGetOffsetNumber(tid));
-				
-				/* Cache page and ItemId for second-phase prefetch */
-				prefetch_cache_out[prefetch_count].page = prefetch_page;
-				prefetch_cache_out[prefetch_count].itemid = itemid;
-				prefetch_count++;
-				
-				/* Prefetch ItemId */
-				__builtin_prefetch(itemid, 0, 3);
+				Page		prefetch_page = BufferGetPage(slots_out[j].frame_id + 1);
+				OffsetNumber offno = ItemPointerGetOffsetNumber(&unvisited[j].indextid);
+
+				__builtin_prefetch(prefetch_page, 0, 3);
+				if (offno > 10)
+					__builtin_prefetch(PageGetItemId(prefetch_page, offno), 0, 3);
 			}
 			else
-			{
-				/* Collect missing block */
 				missing_blocks[missing_count++] = batch_blocknums[j];
-			}
 		}
 
-		*prefetch_count_out = prefetch_count;
-		
 		/*
 		 * Issue bulk async I/O for all missing blocks.
 		 * ReadBuffersAsync will group consecutive blocks and submit
@@ -1330,10 +1245,53 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 								   MAIN_FORKNUM,
 								   missing_blocks,
 								   missing_count);
+
+			/* Refresh slots for newly fetched blocks so search uses fast inline path + prefetch */
+			if (support != NULL)
+			{
+				for (int j = 0; j < count; j++)
+				{
+					if (!slots_out[j].resident)
+					{
+						bool		found = false;
+						uint64		version = 0;
+						uint32		buf_id = 0;
+						void	   *entry_ptr = NULL;
+
+						calico_optimistic_lookup_handle(&support->read_handle,
+														batch_blocknums[j],
+														&found,
+														&version,
+														&buf_id,
+														&entry_ptr);
+						if (found)
+						{
+							slots_out[j].entry_ptr = (CalicoTranslationEntry *) entry_ptr;
+							slots_out[j].version = version;
+							slots_out[j].frame_id = buf_id;
+							slots_out[j].resident = true;
+							slots_out[j].opt_valid = true;
+						}
+					}
+				}
+			}
+		}
+
+		if (tuple_prefetch_bytes > 0)
+		{
+			int			prime = Min(count, HNSW_PREFETCH_AHEAD);
+
+			for (int j = 0; j < prime; j++)
+				HnswPrefetchSlotTuple(&slots_out[j],
+									  ItemPointerGetOffsetNumber(&unvisited[j].indextid),
+									  tuple_prefetch_bytes);
 		}
 	}
-	
-	/* Note: Second pass (vector data prefetch) is now done by caller (HnswSearchLayer) */
+	else
+	{
+		for (int j = 0; j < *unvisitedLength; j++)
+			slots_out[j].opt_valid = false;
+	}
 }
 
 /*
@@ -1354,8 +1312,42 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc_array_checked(HnswUnvisited, lm);
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
-	HnswPrefetchCache prefetch_cache[HNSW_MAX_M * 2];
-	int			prefetch_count = 0;
+	CalicoOptimisticSlot unvisited_slots[HNSW_MAX_M * 2];
+	bool		canOptL2 = false;
+	const Vector *queryVec = NULL;
+	Size		optVecSize = 0;
+	Size		optPrefetchBytes = 0;
+
+	if (!inMemory && !inserting && calico_enable_optimistic_reads &&
+		support != NULL &&
+		support->procinfo->fn_addr == vector_l2_squared_distance &&
+		calico_is_active() && !RelationUsesLocalBuffers(index))
+	{
+		if (DatumGetPointer(q->value) == NULL)
+		{
+			canOptL2 = true;
+			optPrefetchBytes = offsetof(HnswElementTupleData, data);
+		}
+		else
+		{
+			queryVec = (const Vector *) DatumGetPointer(q->value);
+			if (likely(queryVec->dim > 0))
+			{
+				optVecSize = VECTOR_SIZE(queryVec->dim);
+				if (likely(optVecSize <= BLCKSZ - offsetof(HnswElementTupleData, data)))
+				{
+					canOptL2 = true;
+					optPrefetchBytes = Min(offsetof(HnswElementTupleData, data) + optVecSize,
+										   (Size) 1024);
+				}
+			}
+		}
+	}
+	else if (!inMemory && calico_enable_optimistic_reads && hnsw_enable_prefetch &&
+			 calico_is_active() && !RelationUsesLocalBuffers(index))
+	{
+		optPrefetchBytes = sizeof(HnswElementTupleData) + 64;
+	}
 
 	if (v == NULL)
 	{
@@ -1419,11 +1411,14 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		if (inMemory)
 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
 		else
-			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, support, m, lm, lc, prefetch_cache, &prefetch_count);
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, support, m, lm, lc,
+									  unvisited_slots, hnsw_enable_prefetch ? optPrefetchBytes : 0);
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
 			(*tuples) += unvisitedLength;
+
+		f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
 		for (int i = 0; i < unvisitedLength; i++)
 		{
@@ -1432,17 +1427,13 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			double		eDistance;
 			bool		alwaysAdd = wlen < ef;
 
-			/* Prefetch next element's vector data if available and not in memory */
-			if (!inMemory && i + 1 < prefetch_count)
+			/* Prefetch full tuple + vector several steps ahead while evaluating earlier items */
+			if (!inMemory && hnsw_enable_prefetch && i + HNSW_PREFETCH_AHEAD < unvisitedLength)
 			{
-				ItemId		itemid = prefetch_cache[i + 1].itemid;
-				unsigned	offset = ItemIdGetOffset(itemid) & (BLCKSZ - 1);
-
-				__builtin_prefetch(prefetch_cache[i + 1].page + offset +
-								   offsetof(HnswElementTupleData, data), 0, 3);
+				HnswPrefetchSlotTuple(&unvisited_slots[i + HNSW_PREFETCH_AHEAD],
+									  ItemPointerGetOffsetNumber(&unvisited[i + HNSW_PREFETCH_AHEAD].indextid),
+									  optPrefetchBytes);
 			}
-
-			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
 			if (inMemory)
 			{
@@ -1454,10 +1445,18 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				ItemPointer indextid = &unvisited[i].indextid;
 				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
 				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
+				double	   *maxDistPtr = alwaysAdd || discarded != NULL ? NULL : &f->distance;
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+				if (!canOptL2 ||
+					!HnswLoadElementOptimisticSlot(blkno, offno, &unvisited_slots[i],
+												   &eDistance, queryVec, optVecSize,
+												   maxDistPtr, &eElement))
+				{
+					HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support,
+										inserting, maxDistPtr, &eElement);
+				}
 
 				if (eElement == NULL)
 					continue;
@@ -1502,6 +1501,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 						pairingheap_add(*discarded, &d->w_node);
 				}
 			}
+
+			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		}
 	}
 

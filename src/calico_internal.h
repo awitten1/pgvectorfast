@@ -448,6 +448,166 @@ calico_optimistic_lookup_batch_handle(CalicoReadHandle *handle,
         foundOut[i] = (v & CALICO_VALID) != 0;
     }
 }
+
+typedef struct CalicoOptimisticSlot
+{
+    CalicoTranslationEntry *entry_ptr;
+    uint64                  version;
+    uint32                  frame_id;
+    bool                    resident;
+    bool                    opt_valid;
+} CalicoOptimisticSlot;
+
+static inline __attribute__((always_inline)) void
+calico_optimistic_lookup_batch_slots(CalicoReadHandle *handle,
+                                     const BlockNumber *blockNums,
+                                     int count,
+                                     CalicoOptimisticSlot *slotsOut)
+{
+    CalicoTranslationEntry *table;
+    uint32 base_mask;
+    int i = 0;
+
+    if (unlikely(!calico_local_active || count <= 0))
+    {
+        for (int k = 0; k < count; k++)
+        {
+            slotsOut[k].entry_ptr = NULL;
+            slotsOut[k].version = 0;
+            slotsOut[k].frame_id = 0;
+            slotsOut[k].resident = false;
+            slotsOut[k].opt_valid = false;
+        }
+        return;
+    }
+    if (unlikely(!handle->array || handle->region != (blockNums[0] >> 24)))
+    {
+        if (unlikely(!calico_read_handle_entry(handle, blockNums[0])))
+        {
+            for (int k = 0; k < count; k++)
+            {
+                CalicoTranslationEntry *e = calico_read_handle_entry(handle, blockNums[k]);
+                uint64 v = e ? calico_load_entry(e) : 0;
+
+                slotsOut[k].entry_ptr = e;
+                slotsOut[k].version = v;
+                slotsOut[k].frame_id = CalicoGetFrameId(v);
+                slotsOut[k].resident = (v & CALICO_VALID) != 0;
+                slotsOut[k].opt_valid = (v & (CALICO_VALID | CALICO_LOCKED |
+                                              CALICO_NO_OPT | CALICO_UNREADY)) == CALICO_VALID;
+            }
+            pg_read_barrier();
+            return;
+        }
+    }
+    table = handle->array;
+    base_mask = handle->region << 24;
+
+    for (; i + 3 < count; i += 4)
+    {
+        BlockNumber b0 = blockNums[i + 0];
+        BlockNumber b1 = blockNums[i + 1];
+        BlockNumber b2 = blockNums[i + 2];
+        BlockNumber b3 = blockNums[i + 3];
+
+        if (i + 7 < count)
+        {
+            BlockNumber n0 = blockNums[i + 4];
+            BlockNumber n1 = blockNums[i + 5];
+            BlockNumber n2 = blockNums[i + 6];
+            BlockNumber n3 = blockNums[i + 7];
+
+            if (likely((((n0 ^ base_mask) | (n1 ^ base_mask) |
+                         (n2 ^ base_mask) | (n3 ^ base_mask)) >> 24) == 0))
+            {
+                __builtin_prefetch(&table[n0 & CALICO_REGION_MASK], 0, 3);
+                __builtin_prefetch(&table[n1 & CALICO_REGION_MASK], 0, 3);
+                __builtin_prefetch(&table[n2 & CALICO_REGION_MASK], 0, 3);
+                __builtin_prefetch(&table[n3 & CALICO_REGION_MASK], 0, 3);
+            }
+        }
+
+        if (likely((((b0 ^ base_mask) | (b1 ^ base_mask) |
+                     (b2 ^ base_mask) | (b3 ^ base_mask)) >> 24) == 0))
+        {
+            CalicoTranslationEntry *e0 = &table[b0 & CALICO_REGION_MASK];
+            CalicoTranslationEntry *e1 = &table[b1 & CALICO_REGION_MASK];
+            CalicoTranslationEntry *e2 = &table[b2 & CALICO_REGION_MASK];
+            CalicoTranslationEntry *e3 = &table[b3 & CALICO_REGION_MASK];
+            uint64 v0 = calico_load_entry(e0);
+            uint64 v1 = calico_load_entry(e1);
+            uint64 v2 = calico_load_entry(e2);
+            uint64 v3 = calico_load_entry(e3);
+
+            slotsOut[i + 0].entry_ptr = e0;
+            slotsOut[i + 0].version = v0;
+            slotsOut[i + 0].frame_id = CalicoGetFrameId(v0);
+            slotsOut[i + 0].resident = (v0 & CALICO_VALID) != 0;
+            slotsOut[i + 0].opt_valid = (v0 & (CALICO_VALID | CALICO_LOCKED |
+                                               CALICO_NO_OPT | CALICO_UNREADY)) == CALICO_VALID;
+
+            slotsOut[i + 1].entry_ptr = e1;
+            slotsOut[i + 1].version = v1;
+            slotsOut[i + 1].frame_id = CalicoGetFrameId(v1);
+            slotsOut[i + 1].resident = (v1 & CALICO_VALID) != 0;
+            slotsOut[i + 1].opt_valid = (v1 & (CALICO_VALID | CALICO_LOCKED |
+                                               CALICO_NO_OPT | CALICO_UNREADY)) == CALICO_VALID;
+
+            slotsOut[i + 2].entry_ptr = e2;
+            slotsOut[i + 2].version = v2;
+            slotsOut[i + 2].frame_id = CalicoGetFrameId(v2);
+            slotsOut[i + 2].resident = (v2 & CALICO_VALID) != 0;
+            slotsOut[i + 2].opt_valid = (v2 & (CALICO_VALID | CALICO_LOCKED |
+                                               CALICO_NO_OPT | CALICO_UNREADY)) == CALICO_VALID;
+
+            slotsOut[i + 3].entry_ptr = e3;
+            slotsOut[i + 3].version = v3;
+            slotsOut[i + 3].frame_id = CalicoGetFrameId(v3);
+            slotsOut[i + 3].resident = (v3 & CALICO_VALID) != 0;
+            slotsOut[i + 3].opt_valid = (v3 & (CALICO_VALID | CALICO_LOCKED |
+                                               CALICO_NO_OPT | CALICO_UNREADY)) == CALICO_VALID;
+        }
+        else
+        {
+            for (int k = 0; k < 4; k++)
+            {
+                CalicoTranslationEntry *e = calico_read_handle_entry(handle, blockNums[i + k]);
+                uint64 v = e ? calico_load_entry(e) : 0;
+
+                slotsOut[i + k].entry_ptr = e;
+                slotsOut[i + k].version = v;
+                slotsOut[i + k].frame_id = CalicoGetFrameId(v);
+                slotsOut[i + k].resident = (v & CALICO_VALID) != 0;
+                slotsOut[i + k].opt_valid = (v & (CALICO_VALID | CALICO_LOCKED |
+                                                  CALICO_NO_OPT | CALICO_UNREADY)) == CALICO_VALID;
+            }
+            if (handle->array)
+            {
+                table = handle->array;
+                base_mask = handle->region << 24;
+            }
+        }
+    }
+    for (; i < count; i++)
+    {
+        BlockNumber b = blockNums[i];
+        CalicoTranslationEntry *e;
+        uint64 v;
+
+        if (likely((b >> 24) == (base_mask >> 24)))
+            e = &table[b & CALICO_REGION_MASK];
+        else
+            e = calico_read_handle_entry(handle, b);
+        v = e ? calico_load_entry(e) : 0;
+        slotsOut[i].entry_ptr = e;
+        slotsOut[i].version = v;
+        slotsOut[i].frame_id = CalicoGetFrameId(v);
+        slotsOut[i].resident = (v & CALICO_VALID) != 0;
+        slotsOut[i].opt_valid = (v & (CALICO_VALID | CALICO_LOCKED |
+                                      CALICO_NO_OPT | CALICO_UNREADY)) == CALICO_VALID;
+    }
+    pg_read_barrier();
+}
 static inline __attribute__((always_inline)) bool
 calico_optimistic_validate(void *entryPtr,
                                    uint64 expectedVersion)
