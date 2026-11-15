@@ -3,7 +3,7 @@ srcdir ?= $(patsubst %/,%,$(dir $(firstword $(MAKEFILE_LIST))))
 EXTENSION = vector calico
 EXTVERSION = 0.8.7
 
-MODULE_big = vector
+MODULE_big = vectorfast
 DATA = $(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/sql/*--*--*.sql))
 DATA_built = sql/vector--$(EXTVERSION).sql
 DATA += sql/calico--0.1.sql

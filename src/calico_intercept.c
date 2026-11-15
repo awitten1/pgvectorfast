@@ -32,8 +32,38 @@ static struct {
 static int installed_count;
 static const unsigned char *executable;
 static size_t executable_size;
+static const unsigned char *debug_executable;
+static size_t debug_executable_size;
+static bool debug_checked;
 static void redirect_address(void *address, void *replacement, const char *name,
                              void **original, bool native_when_inactive);
+
+static const Elf64_Ehdr *
+validate_elf_image(const unsigned char *image, size_t image_size,
+                   bool check_lto, const char *label)
+{
+    const Elf64_Ehdr *header = (const Elf64_Ehdr *) image;
+
+    if (image_size < sizeof(Elf64_Ehdr) ||
+        memcmp(header->e_ident, ELFMAG, SELFMAG) ||
+        header->e_ident[EI_CLASS] != ELFCLASS64 ||
+        header->e_ident[EI_DATA] != ELFDATA2LSB || header->e_machine != EM_X86_64 ||
+        (header->e_type != ET_EXEC && header->e_type != ET_DYN) ||
+        header->e_shentsize != sizeof(Elf64_Shdr) ||
+        header->e_shoff > image_size ||
+        header->e_shnum > (image_size - header->e_shoff) / sizeof(Elf64_Shdr))
+        elog(FATAL, "unsupported %s for Calico", label);
+    /* Meson's pg_config flags can omit b_lto. Inspect image metadata
+     * before installing any route: LTO can inline buffer mapping and
+     * writer operations past the selected entry points. */
+    if (check_lto &&
+        (memmem(image, image_size, "-flto", 5) ||
+         memmem(image, image_size, ".lto_priv.", 10) ||
+         memmem(image, image_size, ".gnu.lto_", 9) ||
+         memmem(image, image_size, ".llvm.", 6)))
+        elog(FATAL, "Calico does not qualify LTO PostgreSQL executables");
+    return header;
+}
 
 /* Callback entries need not appear in .dynsym. Use the executable's real
  * function symbols as well, and reject an unbounded entry (including a stripped
@@ -42,71 +72,172 @@ static void redirect_address(void *address, void *replacement, const char *name,
 static const Elf64_Ehdr *
 executable_image(void)
 {
-    const Elf64_Ehdr *header;
     if (!executable)
     {
         struct stat statbuf;
         int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+
         if (fd < 0 || fstat(fd, &statbuf) || statbuf.st_size < sizeof(Elf64_Ehdr))
             elog(FATAL, "cannot inspect PostgreSQL ELF image: %m");
         executable_size = statbuf.st_size;
         executable = mmap(NULL, executable_size, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
         if (executable == MAP_FAILED)
+        {
+            executable = NULL;
             elog(FATAL, "cannot map PostgreSQL ELF image: %m");
-        /* Meson's pg_config flags can omit b_lto. Inspect executable metadata
-         * before installing any route: LTO can inline buffer mapping and
-         * writer operations past the selected entry points. */
-        if (memmem(executable, executable_size, "-flto", 5) ||
-            memmem(executable, executable_size, ".lto_priv.", 10) ||
-            memmem(executable, executable_size, ".gnu.lto_", 9) ||
-            memmem(executable, executable_size, ".llvm.", 6))
-            elog(FATAL, "Calico does not qualify LTO PostgreSQL executables");
+        }
     }
-    header = (const Elf64_Ehdr *) executable;
-    if (memcmp(header->e_ident, ELFMAG, SELFMAG) ||
-        header->e_ident[EI_CLASS] != ELFCLASS64 ||
-        header->e_ident[EI_DATA] != ELFDATA2LSB || header->e_machine != EM_X86_64 ||
-        (header->e_type != ET_EXEC && header->e_type != ET_DYN) ||
-        header->e_shentsize != sizeof(Elf64_Shdr) ||
-        header->e_shoff > executable_size ||
-        header->e_shnum > (executable_size - header->e_shoff) / sizeof(Elf64_Shdr))
-        elog(FATAL, "unsupported PostgreSQL ELF image for Calico");
-    return header;
+    return validate_elf_image(executable, executable_size, true,
+                              "PostgreSQL ELF image");
 }
 
-static size_t
-function_size(void *address, const Dl_info *info, const char *name)
+static bool
+find_build_id(const unsigned char *image, size_t image_size,
+              const unsigned char **id_out, size_t *len_out)
 {
-    const Elf64_Ehdr *header = executable_image();
-    const Elf64_Shdr *sections;
-    size_t result = 0;
-    sections = (const Elf64_Shdr *) (executable + header->e_shoff);
-    for (unsigned int i = 0; i < header->e_shnum; i++)
+    const Elf64_Ehdr *header = (const Elf64_Ehdr *) image;
+    const Elf64_Shdr *sections = (const Elf64_Shdr *) (image + header->e_shoff);
+    unsigned int i;
+
+    for (i = 0; i < header->e_shnum; i++)
+    {
+        const Elf64_Shdr *section = &sections[i];
+        size_t offset = 0;
+
+        if (section->sh_type != SHT_NOTE ||
+            section->sh_offset > image_size ||
+            section->sh_size > image_size - section->sh_offset)
+            continue;
+        while (offset + sizeof(Elf64_Nhdr) <= section->sh_size)
+        {
+            const Elf64_Nhdr *note = (const Elf64_Nhdr *) (image + section->sh_offset + offset);
+            size_t name_off = offset + sizeof(Elf64_Nhdr);
+            size_t name_aligned = (note->n_namesz + 3u) & ~(size_t) 3u;
+            size_t desc_aligned = (note->n_descsz + 3u) & ~(size_t) 3u;
+
+            if (name_aligned > section->sh_size - name_off)
+                break;
+            if (desc_aligned > section->sh_size - (name_off + name_aligned))
+                break;
+            if (note->n_type == NT_GNU_BUILD_ID && note->n_namesz == 4 &&
+                memcmp(image + section->sh_offset + name_off, "GNU", 4) == 0 &&
+                note->n_descsz >= 2 && note->n_descsz <= 64)
+            {
+                *id_out = image + section->sh_offset + name_off + name_aligned;
+                *len_out = note->n_descsz;
+                return true;
+            }
+            offset = name_off + name_aligned + desc_aligned;
+        }
+    }
+    return false;
+}
+
+static bool
+image_has_symtab(const unsigned char *image)
+{
+    const Elf64_Ehdr *header = (const Elf64_Ehdr *) image;
+    const Elf64_Shdr *sections = (const Elf64_Shdr *) (image + header->e_shoff);
+    unsigned int i;
+
+    for (i = 0; i < header->e_shnum; i++)
+        if (sections[i].sh_type == SHT_SYMTAB)
+            return true;
+    return false;
+}
+
+/* Packaged builds (such as PGDG Debian/Ubuntu packages) strip .symtab into
+ * /usr/lib/debug/.build-id/<xx>/<rest>.debug. Verify NT_GNU_BUILD_ID matches
+ * the running executable byte-for-byte before trusting split symbol metadata. */
+static const Elf64_Ehdr *
+split_debug_image(void)
+{
+    const Elf64_Ehdr *exe_header = executable_image();
+    const Elf64_Ehdr *dbg_header;
+    const unsigned char *exe_id = NULL, *dbg_id = NULL;
+    size_t exe_id_len = 0, dbg_id_len = 0;
+    char path[PATH_MAX];
+    char hex[129];
+    size_t i;
+    struct stat statbuf;
+    int fd;
+
+    if (debug_checked)
+        return debug_executable ? (const Elf64_Ehdr *) debug_executable : NULL;
+    debug_checked = true;
+
+    if (image_has_symtab(executable))
+        return NULL;
+    if (!find_build_id(executable, executable_size, &exe_id, &exe_id_len))
+        return NULL;
+    for (i = 0; i < exe_id_len; i++)
+        snprintf(hex + i * 2, 3, "%02x", exe_id[i]);
+    snprintf(path, sizeof(path), "/usr/lib/debug/.build-id/%.2s/%s.debug",
+             hex, hex + 2);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return NULL;
+    if (fstat(fd, &statbuf) || statbuf.st_size < sizeof(Elf64_Ehdr))
+    {
+        close(fd);
+        return NULL;
+    }
+    debug_executable_size = statbuf.st_size;
+    debug_executable = mmap(NULL, debug_executable_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (debug_executable == MAP_FAILED)
+    {
+        debug_executable = NULL;
+        debug_executable_size = 0;
+        elog(FATAL, "cannot map PostgreSQL debug ELF image %s: %m", path);
+    }
+    dbg_header = validate_elf_image(debug_executable, debug_executable_size,
+                                    true, "PostgreSQL debug ELF image");
+    if (dbg_header->e_type != exe_header->e_type ||
+        !find_build_id(debug_executable, debug_executable_size, &dbg_id, &dbg_id_len) ||
+        dbg_id_len != exe_id_len || memcmp(dbg_id, exe_id, exe_id_len) != 0)
+        elog(FATAL, "PostgreSQL debug ELF image %s does not match running executable", path);
+    return dbg_header;
+}
+
+static void
+scan_function_symbols(const unsigned char *image, size_t image_size,
+                      void *address, const Dl_info *info, const char *name,
+                      size_t *result)
+{
+    const Elf64_Ehdr *header = (const Elf64_Ehdr *) image;
+    const Elf64_Shdr *sections = (const Elf64_Shdr *) (image + header->e_shoff);
+    uintptr_t bias = header->e_type == ET_DYN ? (uintptr_t) info->dli_fbase : 0;
+    unsigned int i;
+
+    for (i = 0; i < header->e_shnum; i++)
     {
         const Elf64_Shdr *section = &sections[i];
         const Elf64_Sym *symbols;
         const Elf64_Shdr *strings;
-        uintptr_t bias = header->e_type == ET_DYN ? (uintptr_t) info->dli_fbase : 0;
+        size_t j;
+
         if (section->sh_type != SHT_SYMTAB && section->sh_type != SHT_DYNSYM)
             continue;
         if (section->sh_entsize != sizeof(Elf64_Sym) ||
-            section->sh_offset > executable_size ||
-            section->sh_size > executable_size - section->sh_offset ||
+            section->sh_offset > image_size ||
+            section->sh_size > image_size - section->sh_offset ||
             section->sh_link >= header->e_shnum)
             elog(FATAL, "invalid PostgreSQL ELF symbol table");
         strings = &sections[section->sh_link];
-        if (strings->sh_offset > executable_size ||
-            strings->sh_size > executable_size - strings->sh_offset)
+        if (strings->sh_offset > image_size ||
+            strings->sh_size > image_size - strings->sh_offset)
             elog(FATAL, "invalid PostgreSQL ELF string table");
-        symbols = (const Elf64_Sym *) (executable + section->sh_offset);
-        for (size_t j = 0; j < section->sh_size / sizeof(Elf64_Sym); j++)
+        symbols = (const Elf64_Sym *) (image + section->sh_offset);
+        for (j = 0; j < section->sh_size / sizeof(Elf64_Sym); j++)
         {
             const Elf64_Sym *symbol = &symbols[j];
             const char *symbol_name;
+
             if (symbol->st_name >= strings->sh_size)
                 elog(FATAL, "invalid PostgreSQL ELF symbol name");
-            symbol_name = (const char *) executable + strings->sh_offset + symbol->st_name;
+            symbol_name = (const char *) image + strings->sh_offset + symbol->st_name;
             if (!memchr(symbol_name, 0, strings->sh_size - symbol->st_name))
                 elog(FATAL, "unterminated PostgreSQL ELF symbol name");
             /* Cross-entry optimized clones have their own addresses and
@@ -122,61 +253,70 @@ function_size(void *address, const Dl_info *info, const char *name)
             if (ELF64_ST_TYPE(symbol->st_info) == STT_FUNC &&
                 symbol->st_shndx != SHN_UNDEF && symbol->st_size &&
                 bias + symbol->st_value == (uintptr_t) address &&
-                (!result || symbol->st_size < result))
-                result = symbol->st_size;
+                (!*result || symbol->st_size < *result))
+                *result = symbol->st_size;
         }
     }
+}
+
+static size_t
+function_size(void *address, const Dl_info *info, const char *name)
+{
+    size_t result = 0;
+
+    executable_image();
+    scan_function_symbols(executable, executable_size, address, info, name, &result);
+    if (split_debug_image())
+        scan_function_symbols(debug_executable, debug_executable_size,
+                              address, info, name, &result);
     if (!result)
         ereport(FATAL, (errmsg("cannot bound PostgreSQL entry %s for Calico", name),
-            errhint("Use a qualified executable retaining its function symbol table.")));
+            errhint("Use a qualified executable retaining its function symbol table, or install matching debug symbols (e.g. postgresql-%d-dbgsym).",
+                    PG_MAJORVERSION_NUM)));
     return result;
 }
 
-/* Resolve private data once in the postmaster. Children inherit pointers to
- * their own native backend-local storage; buffer accesses need no lookup or
- * synchronization. Private layout is checked by the version adapter as well
- * as the ELF symbol size. A stripped or ambiguous image is unsupported. */
-void *
-calico_native_data(const char *name, size_t size, size_t alignment)
+static void
+scan_data_symbols(const unsigned char *image, size_t image_size,
+                  uintptr_t bias, const char *name, size_t size,
+                  size_t alignment, uintptr_t *result)
 {
-    const Elf64_Ehdr *header = executable_image();
-    const Elf64_Shdr *sections = (const Elf64_Shdr *) (executable + header->e_shoff);
-    Dl_info info;
-    uintptr_t result = 0;
-    uintptr_t bias;
+    const Elf64_Ehdr *header = (const Elf64_Ehdr *) image;
+    const Elf64_Shdr *sections = (const Elf64_Shdr *) (image + header->e_shoff);
+    unsigned int i;
 
-    if (!dladdr(dlsym(RTLD_DEFAULT, "ReadBuffer"), &info))
-        elog(FATAL, "cannot locate PostgreSQL executable for Calico");
-    bias = header->e_type == ET_DYN ? (uintptr_t) info.dli_fbase : 0;
-    for (unsigned int i = 0; i < header->e_shnum; i++)
+    for (i = 0; i < header->e_shnum; i++)
     {
         const Elf64_Shdr *table = &sections[i];
         const Elf64_Shdr *strings;
         const Elf64_Sym *symbols;
+        size_t j;
+
         if (table->sh_type != SHT_SYMTAB && table->sh_type != SHT_DYNSYM)
             continue;
         if (table->sh_entsize != sizeof(Elf64_Sym) ||
-            table->sh_offset > executable_size ||
-            table->sh_size > executable_size - table->sh_offset ||
+            table->sh_offset > image_size ||
+            table->sh_size > image_size - table->sh_offset ||
             table->sh_link >= header->e_shnum)
             elog(FATAL, "invalid PostgreSQL ELF symbol table");
         strings = &sections[table->sh_link];
-        if (strings->sh_offset > executable_size ||
-            strings->sh_size > executable_size - strings->sh_offset)
+        if (strings->sh_offset > image_size ||
+            strings->sh_size > image_size - strings->sh_offset)
             elog(FATAL, "invalid PostgreSQL ELF string table");
-        symbols = (const Elf64_Sym *) (executable + table->sh_offset);
-        for (size_t j = 0; j < table->sh_size / sizeof(Elf64_Sym); j++)
+        symbols = (const Elf64_Sym *) (image + table->sh_offset);
+        for (j = 0; j < table->sh_size / sizeof(Elf64_Sym); j++)
         {
             const Elf64_Sym *symbol = &symbols[j];
             const Elf64_Shdr *storage;
             const char *symbol_name;
             uintptr_t address;
+
             if (ELF64_ST_TYPE(symbol->st_info) != STT_OBJECT ||
                 symbol->st_shndx == SHN_UNDEF)
                 continue;
             if (symbol->st_name >= strings->sh_size)
                 elog(FATAL, "invalid PostgreSQL ELF symbol name");
-            symbol_name = (const char *) executable + strings->sh_offset + symbol->st_name;
+            symbol_name = (const char *) image + strings->sh_offset + symbol->st_name;
             if (!memchr(symbol_name, 0, strings->sh_size - symbol->st_name))
                 elog(FATAL, "unterminated PostgreSQL ELF symbol name");
             if (strcmp(symbol_name, name) != 0)
@@ -190,14 +330,37 @@ calico_native_data(const char *name, size_t size, size_t alignment)
                 symbol->st_value < storage->sh_addr ||
                 symbol->st_value - storage->sh_addr > storage->sh_size ||
                 size > storage->sh_size - (symbol->st_value - storage->sh_addr) ||
-                (result && result != address))
+                (*result && *result != address))
                 elog(FATAL, "incompatible PostgreSQL private state %s for Calico", name);
-            result = address;
+            *result = address;
         }
     }
+}
+
+/* Resolve private data once in the postmaster. Children inherit pointers to
+ * their own native backend-local storage; buffer accesses need no lookup or
+ * synchronization. Private layout is checked by the version adapter as well
+ * as the ELF symbol size. A stripped or ambiguous image is unsupported. */
+void *
+calico_native_data(const char *name, size_t size, size_t alignment)
+{
+    const Elf64_Ehdr *header = executable_image();
+    Dl_info info;
+    uintptr_t result = 0;
+    uintptr_t bias;
+
+    if (!dladdr(dlsym(RTLD_DEFAULT, "ReadBuffer"), &info))
+        elog(FATAL, "cannot locate PostgreSQL executable for Calico");
+    bias = header->e_type == ET_DYN ? (uintptr_t) info.dli_fbase : 0;
+    scan_data_symbols(executable, executable_size, bias, name, size, alignment,
+                      &result);
+    if (split_debug_image())
+        scan_data_symbols(debug_executable, debug_executable_size, bias, name,
+                          size, alignment, &result);
     if (!result)
         ereport(FATAL, (errmsg("cannot locate PostgreSQL private state %s for Calico", name),
-            errhint("Retain the executable's private data symbol table.")));
+            errhint("Retain the executable's private data symbol table, or install matching debug symbols (e.g. postgresql-%d-dbgsym).",
+                    PG_MAJORVERSION_NUM)));
     /* Section metadata must also describe storage in a writable load segment. */
     if (header->e_phentsize == sizeof(Elf64_Phdr) &&
         header->e_phoff <= executable_size &&
@@ -205,9 +368,12 @@ calico_native_data(const char *name, size_t size, size_t alignment)
     {
         const Elf64_Phdr *segments = (const Elf64_Phdr *) (executable + header->e_phoff);
         uintptr_t value = result - bias;
-        for (unsigned int i = 0; i < header->e_phnum; i++)
+        unsigned int i;
+
+        for (i = 0; i < header->e_phnum; i++)
         {
             const Elf64_Phdr *segment = &segments[i];
+
             if (segment->p_type == PT_LOAD && (segment->p_flags & PF_W) &&
                 value >= segment->p_vaddr && value - segment->p_vaddr <= segment->p_memsz &&
                 size <= segment->p_memsz - (value - segment->p_vaddr))
@@ -224,6 +390,12 @@ calico_interception_finish(void)
     if (executable)
         munmap((void *) executable, executable_size);
     executable = NULL;
+    executable_size = 0;
+    if (debug_executable)
+        munmap((void *) debug_executable, debug_executable_size);
+    debug_executable = NULL;
+    debug_executable_size = 0;
+    debug_checked = false;
 }
 
 static void

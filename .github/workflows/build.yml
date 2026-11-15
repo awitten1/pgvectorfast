@@ -59,7 +59,7 @@ jobs:
           export PATH="$PG_PREFIX/bin:$PATH"
           export PG_CONFIG="$PG_PREFIX/bin/pg_config"
           initdb -D "$PGDATA" --no-locale -E UTF8
-          printf "\nlisten_addresses=''\nunix_socket_directories='/tmp'\nshared_preload_libraries='vector'\n" >> "$PGDATA/postgresql.conf"
+          printf "\nlisten_addresses=''\nunix_socket_directories='/tmp'\nshared_preload_libraries='vectorfast'\n" >> "$PGDATA/postgresql.conf"
           pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/postgres.log" -w start
           trap 'pg_ctl -D "$PGDATA" -m fast -w stop || true' EXIT
           psql -h /tmp -d postgres -v ON_ERROR_STOP=1 -f examples/getting-started.sql

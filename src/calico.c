@@ -86,7 +86,7 @@ calico_activate(PG_FUNCTION_ARGS)
         ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                         errmsg("Calico activation requires superuser")));
     if (!prepared)
-        ereport(ERROR, (errmsg("Calico requires shared_preload_libraries = 'vector'"),
+        ereport(ERROR, (errmsg("Calico requires shared_preload_libraries = 'vectorfast'"),
                         errhint("Preload the library and restart PostgreSQL first.")));
     /* The transaction API cannot infer nested CALL/function execution when
      * given isTopLevel=true. Require this procedure to be the portal's actual

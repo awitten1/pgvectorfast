@@ -1,7 +1,7 @@
 <h1 align="center">pgvectorfast</h1>
 <p align="center"><strong>pgvectorfast is a high-performance drop-in enhancement for <a href="PGVECTOR.md">pgvector</a> that accelerates vector similarity search and analytical queries in PostgreSQL using a fast shared buffer pool.</strong></p>
 
-Based on [pgvector v0.8.7](https://github.com/pgvector/pgvector/releases/tag/v0.8.7), pgvectorfast installs as a standard PostgreSQL extension (`vector.so`) on unmodified PostgreSQL 18 and 19 servers (Linux x86-64)—no PostgreSQL source patches or server recompilation required. It preserves complete SQL and on-disk compatibility with all `pgvector` data types (`vector`, `halfvec`, `bit`, `sparsevec`), distance operators, and index types (`hnsw`, `ivfflat`). See the [pgvector Documentation](PGVECTOR.md) for the full SQL API, index parameters, and usage guide.
+Based on [pgvector v0.8.7](https://github.com/pgvector/pgvector/releases/tag/v0.8.7), pgvectorfast installs as a standard PostgreSQL extension (`vectorfast.so`) on unmodified PostgreSQL 18 and 19 servers (Linux x86-64)—no PostgreSQL source patches or server recompilation required. It preserves complete SQL and on-disk compatibility with all `pgvector` data types (`vector`, `halfvec`, `bit`, `sparsevec`), distance operators, and index types (`hnsw`, `ivfflat`). See the [pgvector Documentation](PGVECTOR.md) for the full SQL API, index parameters, and usage guide.
 
 ## Benchmark Results
 
@@ -38,14 +38,53 @@ pgvectorfast replaces PostgreSQL's shared buffer manager with the **Calico** buf
 
 ## Installation
 
-### Prerequisites
+### Docker
+
+Pull and run a ready-to-use image for x86-64 (`linux/amd64`) with PostgreSQL 18, matching debug symbols (`postgresql-18-dbgsym`), and `shared_preload_libraries = 'vectorfast'` preconfigured:
+
+```sh
+docker run -d \
+  --name pgvectorfast \
+  -e POSTGRES_PASSWORD=mysecretpassword \
+  -p 5432:5432 \
+  zxjcarrot/pgvectorfast:pg18
+```
+
+Available tags: `pg18` / `latest` (`postgres:18-trixie`), `pg18-trixie`, `pg18-bookworm`, and `<version>-pg18` on release tags.
+
+To build the image locally:
+
+```sh
+docker build --build-arg PG_MAJOR=18 -t pgvectorfast .
+```
+
+### APT (Debian)
+
+Prebuilt `postgresql-18-pgvectorfast` packages for Linux x86-64 (`amd64`) are published for Debian 12 (`bookworm`) and Debian 13 (`trixie`) against the [PostgreSQL PGDG APT repository](https://wiki.postgresql.org/wiki/Apt). They declare `Conflicts`/`Replaces`/`Provides` for `postgresql-18-pgvector` and depend on matching `postgresql-18-dbgsym` symbols. (Ubuntu PGDG packages compile PostgreSQL with `-flto=auto`, which Calico rejects at startup because LTO inlines internal buffer-manager routines; on Ubuntu, use the [Docker image](#docker) or [build from source](#build-and-install-from-source) against a non-LTO PostgreSQL build.)
+
+1. Ensure the [PostgreSQL APT repository (PGDG)](https://wiki.postgresql.org/wiki/Apt) is enabled (for example via `postgresql-common` / `/usr/share/postgresql-common/pgdg/apt.postgresql.org.sh`).
+2. Add the `pgvectorfast` APT signing key and repository, then install:
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://mitdbg.github.io/pgvectorfast/pgvectorfast.asc | sudo tee /etc/apt/keyrings/pgvectorfast.asc >/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/pgvectorfast.asc] https://mitdbg.github.io/pgvectorfast $(. /etc/os-release && echo "$VERSION_CODENAME") main" | sudo tee /etc/apt/sources.list.d/pgvectorfast.list
+sudo apt-get update
+sudo apt-get install -y postgresql-18-pgvectorfast
+```
+
+3. Continue with [Quick Start](#quick-start) to preload `vectorfast` in `postgresql.conf` and activate Calico.
+
+### Build and Install from Source
+
+#### Prerequisites
 
 - Linux x86-64
-- PostgreSQL 18 or 19 with server development headers (`pg_config`) and unstripped function/data symbols (non-LTO server build)
+- PostgreSQL 18 or 19 with server development headers (`pg_config`) and non-LTO server symbols: either an unstripped source build or a packaged build with matching debug symbols installed (e.g. `postgresql-18-dbgsym`)
 - C compiler (GCC or Clang) and GNU Make
-- Capstone 5 (`capstone==5.0.6`): automatically detected from `/usr/local` or `/usr`, or bootstrapped into `~/.cache/pgvectorfast/python-deps` via Python `pip` during `make` (override with `CAPSTONE_PREFIX=/path/to/capstone`; must remain available at runtime)
+- Capstone (`libcapstone-dev` 4.x/5.x from system packages, or automatically bootstrapped as `capstone==5.0.6` into `~/.cache/pgvectorfast/python-deps` via Python `pip` during `make`; override with `CAPSTONE_PREFIX=/path/to/capstone`; must remain available at runtime)
 
-### Build and Install
+#### Build and Install
 
 ```sh
 git clone https://github.com/mitdbg/pgvectorfast.git
@@ -63,10 +102,10 @@ make PG_CONFIG=/path/to/pg_config install
 
 ## Quick Start
 
-1. Add `vector` to `shared_preload_libraries` in `postgresql.conf` and restart PostgreSQL:
+1. Add `vectorfast` to `shared_preload_libraries` in `postgresql.conf` and restart PostgreSQL:
 
 ```ini
-shared_preload_libraries = 'vector'
+shared_preload_libraries = 'vectorfast'
 ```
 
 2. Create the extensions and activate the Calico buffer pool (as superuser, outside a transaction block):

@@ -226,7 +226,7 @@ calico_register_worker(void)
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
     worker.bgw_start_time = BgWorkerStart_ConsistentState;
     worker.bgw_restart_time = 1;
-    strlcpy(worker.bgw_library_name, "vector", BGW_MAXLEN);
+    strlcpy(worker.bgw_library_name, "vectorfast", BGW_MAXLEN);
     strlcpy(worker.bgw_function_name, "CalicoWorkerMain", BGW_MAXLEN);
     RegisterBackgroundWorker(&worker);
 }

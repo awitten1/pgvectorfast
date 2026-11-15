@@ -1,0 +1,238 @@
+name: apt
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - packaging/apt/**
+      - apt/**
+      - Makefile
+      - '*.control'
+      - 'src/**'
+      - 'sql/**'
+      - 'examples/**'
+      - '.github/workflows/apt.yml'
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - codename: trixie
+            image: debian:trixie
+            pg_major: '18'
+          - codename: bookworm
+            image: debian:bookworm
+            pg_major: '18'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute package version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF_NAME#v}"
+          else
+            base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || echo '0.1.0')
+            rev=$(git rev-list --count "v${base}..HEAD" 2>/dev/null || echo '0')
+            if [ "$rev" -gt 0 ]; then
+              ver="${base}.${rev}"
+            else
+              ver="${base}"
+            fi
+          fi
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+      - name: Build .deb in ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.codename }}"
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/dist/${{ matrix.codename }}:/out" \
+            -e PG_MAJOR="${{ matrix.pg_major }}" \
+            -e PGVECTORFAST_VERSION="${{ steps.version.outputs.version }}" \
+            -e CODENAME="${{ matrix.codename }}" \
+            "${{ matrix.image }}" \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq curl ca-certificates gnupg >/dev/null
+              curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+              echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+              apt-get update -qq
+              apt-get install -y -qq \
+                build-essential dpkg-dev pkg-config libcapstone-dev \
+                "postgresql-${PG_MAJOR}" "postgresql-${PG_MAJOR}-dbgsym" "postgresql-server-dev-${PG_MAJOR}" >/dev/null
+              OUTDIR=/out bash /src/packaging/apt/build-deb.sh
+            '
+      - name: Test clean .deb installation in ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/dist/${{ matrix.codename }}:/debs:ro" \
+            -e PG_MAJOR="${{ matrix.pg_major }}" \
+            -e CODENAME="${{ matrix.codename }}" \
+            "${{ matrix.image }}" \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq curl ca-certificates gnupg >/dev/null
+              curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+              echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+              apt-get update -qq
+              apt-get install -y -qq /debs/*.deb >/dev/null
+              su - postgres -c "
+                set -euo pipefail
+                export PATH=/usr/lib/postgresql/${PG_MAJOR}/bin:\$PATH
+                PGDATA=/tmp/pgdata
+                initdb -D \"\$PGDATA\" --no-locale -E UTF8 >/dev/null
+                printf \"\nlisten_addresses=\x27\x27\nunix_socket_directories=\x27/tmp\x27\nshared_preload_libraries=\x27vectorfast\x27\n\" >> \"\$PGDATA/postgresql.conf\"
+                pg_ctl -D \"\$PGDATA\" -l /tmp/pg.log -w start
+                psql -h /tmp -d postgres -v ON_ERROR_STOP=1 -f \"/usr/share/doc/postgresql-${PG_MAJOR}-pgvectorfast/examples/getting-started.sql\"
+                psql -h /tmp -d postgres -v ON_ERROR_STOP=1 \
+                  -c \"CREATE EXTENSION vector;\" \
+                  -c \"CREATE EXTENSION calico;\" \
+                  -c \"CALL calico.activate();\"
+                status=\$(psql -h /tmp -d postgres -tAc \"SELECT calico.status();\")
+                [ \"\$status\" = \"calico\" ]
+                pg_ctl -D \"\$PGDATA\" -m fast -w stop
+              "
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.codename }}
+          path: dist/${{ matrix.codename }}/*.deb
+
+  publish-apt:
+    needs: build-deb
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: incoming
+      - name: Install APT repository tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dpkg-dev apt-utils gnupg
+      - name: Checkout or initialize gh-pages
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git worktree add --track -B gh-pages apt-repo origin/gh-pages
+          else
+            empty_tree=$(git hash-object -t tree /dev/null)
+            init_commit=$(git commit-tree "$empty_tree" -m "Initialize gh-pages")
+            git worktree add -b gh-pages apt-repo "$init_commit"
+          fi
+      - name: Build and sign APT repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" | GNUPGHOME="$GNUPGHOME" gpg --batch --import
+          KEY_FPR=$(GNUPGHOME="$GNUPGHOME" gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+          export GNUPGHOME
+
+          cp apt/pgvectorfast.asc apt-repo/pgvectorfast.asc
+          gpg --batch --yes --dearmor -o apt-repo/pgvectorfast.gpg apt-repo/pgvectorfast.asc
+
+          for codename in trixie bookworm; do
+            pool_dir="apt-repo/pool/${codename}/main/p/postgresql-18-pgvectorfast"
+            dist_dir="apt-repo/dists/${codename}/main/binary-amd64"
+            mkdir -p "$pool_dir" "$dist_dir"
+
+            cp "incoming/deb-${codename}/"*.deb "$pool_dir/"
+            # Retain the 5 most recent builds per distro so existing PG point releases remain installable.
+            (
+              cd "$pool_dir"
+              ls -t *.deb | tail -n +6 | xargs -r rm -f
+            )
+
+            (
+              cd apt-repo
+              dpkg-scanpackages -m "pool/${codename}/main" > "dists/${codename}/main/binary-amd64/Packages"
+              gzip -9c "dists/${codename}/main/binary-amd64/Packages" > "dists/${codename}/main/binary-amd64/Packages.gz"
+            )
+
+            rm -f "apt-repo/dists/${codename}/Release" \
+                  "apt-repo/dists/${codename}/Release.gpg" \
+                  "apt-repo/dists/${codename}/InRelease"
+            apt-ftparchive \
+              -o APT::FTPArchive::Release::Origin="pgvectorfast" \
+              -o APT::FTPArchive::Release::Label="pgvectorfast" \
+              -o APT::FTPArchive::Release::Suite="${codename}" \
+              -o APT::FTPArchive::Release::Codename="${codename}" \
+              -o APT::FTPArchive::Release::Architectures="amd64" \
+              -o APT::FTPArchive::Release::Components="main" \
+              release "apt-repo/dists/${codename}" > "apt-repo/dists/${codename}/Release"
+
+            printf '%s\n' "$APT_GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 --digest-algo SHA512 -u "$KEY_FPR" -abs \
+              -o "apt-repo/dists/${codename}/Release.gpg" \
+              "apt-repo/dists/${codename}/Release"
+            printf '%s\n' "$APT_GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+              --passphrase-fd 0 --digest-algo SHA512 -u "$KEY_FPR" --clearsign \
+              -o "apt-repo/dists/${codename}/InRelease" \
+              "apt-repo/dists/${codename}/Release"
+          done
+
+          printf '%s\n' \
+            '<!doctype html>' \
+            '<html lang="en">' \
+            '<head><meta charset="utf-8"><title>pgvectorfast APT Repository</title></head>' \
+            '<body>' \
+            '<h1>pgvectorfast APT Repository</h1>' \
+            '<p>Debian (trixie, bookworm) x86-64 packages for <a href="https://github.com/mitdbg/pgvectorfast">pgvectorfast</a>.</p>' \
+            '<p>Public signing key: <a href="pgvectorfast.asc">pgvectorfast.asc</a> / <a href="pgvectorfast.gpg">pgvectorfast.gpg</a></p>' \
+            '</body>' \
+            '</html>' > apt-repo/index.html
+          touch apt-repo/.nojekyll
+      - name: Verify signed APT repository with trixie apt
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/apt-repo:/repo:ro" debian:trixie bash -euo pipefail -c '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq && apt-get install -y -qq python3 >/dev/null
+            python3 -m http.server 18080 --directory /repo >/dev/null 2>&1 &
+            srv_pid=$!
+            trap "kill $srv_pid 2>/dev/null || true" EXIT
+            sleep 1
+            install -d -m 0755 /etc/apt/keyrings
+            install -m 0644 /repo/pgvectorfast.asc /etc/apt/keyrings/pgvectorfast.asc
+            echo "deb [signed-by=/etc/apt/keyrings/pgvectorfast.asc] http://127.0.0.1:18080 trixie main" > /etc/apt/sources.list.d/pgvectorfast.list
+            apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/pgvectorfast.list -o Dir::Etc::sourceparts=-
+            apt-cache policy postgresql-18-pgvectorfast
+          '
+      - name: Push gh-pages
+        run: |
+          set -euo pipefail
+          cd apt-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No APT repository changes to publish"
+            exit 0
+          fi
+          git commit -m "Publish APT repository for ${GITHUB_SHA}"
+          git push origin gh-pages

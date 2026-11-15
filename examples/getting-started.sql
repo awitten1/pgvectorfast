@@ -1,5 +1,5 @@
 \set ON_ERROR_STOP on
--- Run as superuser in a scratch database after preloading vector.
+-- Run as superuser in a scratch database after preloading vectorfast.
 CREATE EXTENSION vector;
 CREATE EXTENSION calico;
 

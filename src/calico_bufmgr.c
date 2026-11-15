@@ -3,7 +3,24 @@
  * PostgreSQL read and writer adapters are maintained alongside this file.
  */
 #include "postgres.h"
+#include "port/pg_bitutils.h"
 #include <dlfcn.h>
+
+/*
+ * Packaged PostgreSQL builds compiled with --enable-dtrace pull in
+ * utils/probes.h via pg_trace.h, whose semaphore symbols exist only in the
+ * server executable and whose header requires systemtap-sdt-dev. Stub those
+ * buffer probes out before including the server buffer manager adapters.
+ */
+#ifndef PG_TRACE_H
+#define PG_TRACE_H
+#define TRACE_POSTGRESQL_BUFFER_READ_START(a0, a1, a2, a3, a4, a5) do {} while (0)
+#define TRACE_POSTGRESQL_BUFFER_READ_DONE(a0, a1, a2, a3, a4, a5, a6) do {} while (0)
+#define TRACE_POSTGRESQL_BUFFER_EXTEND_START(a0, a1, a2, a3, a4, a5) do {} while (0)
+#define TRACE_POSTGRESQL_BUFFER_EXTEND_DONE(a0, a1, a2, a3, a4, a5, a6) do {} while (0)
+#define TRACE_POSTGRESQL_BUFFER_FLUSH_START(a0, a1, a2, a3, a4) do {} while (0)
+#define TRACE_POSTGRESQL_BUFFER_FLUSH_DONE(a0, a1, a2, a3, a4) do {} while (0)
+#endif
 
 #if PG_VERSION_NUM >= 180000 && PG_VERSION_NUM < 190000
 #include "calico_bufmgr18.inc"
