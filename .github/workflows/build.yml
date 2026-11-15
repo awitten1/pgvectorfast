@@ -11,15 +11,19 @@ jobs:
         compiler: [gcc, clang]
     env:
       CC: ${{ matrix.compiler }}
-      PG_PREFIX: ${{ runner.temp }}/pg-${{ matrix.postgres }}-${{ matrix.compiler }}
-      PG_SRC: ${{ runner.temp }}/postgres-src-${{ matrix.postgres }}-${{ matrix.compiler }}
-      PG_BUILD: ${{ runner.temp }}/postgres-build-${{ matrix.postgres }}-${{ matrix.compiler }}
-      PGDATA: ${{ runner.temp }}/pgdata-${{ matrix.postgres }}-${{ matrix.compiler }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Configure environment paths
+        run: |
+          {
+            echo "PG_PREFIX=$RUNNER_TEMP/pg-${{ matrix.postgres }}-${{ matrix.compiler }}"
+            echo "PG_SRC=$RUNNER_TEMP/postgres-src-${{ matrix.postgres }}-${{ matrix.compiler }}"
+            echo "PG_BUILD=$RUNNER_TEMP/postgres-build-${{ matrix.postgres }}-${{ matrix.compiler }}"
+            echo "PGDATA=$RUNNER_TEMP/pgdata-${{ matrix.postgres }}-${{ matrix.compiler }}"
+          } >> "$GITHUB_ENV"
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -27,7 +31,11 @@ jobs:
           python3 -m pip install meson ninja
       - name: Build and install PostgreSQL ${{ matrix.postgres }}
         run: |
-          PG_REF="${{ matrix.postgres == 18 && 'REL_18_0' || 'REL_19_BETA3' }}"
+          if [ "${{ matrix.postgres }}" = "18" ]; then
+            PG_REF="REL_18_0"
+          else
+            PG_REF="REL_19_BETA3"
+          fi
           git clone --depth 1 --branch "$PG_REF" https://github.com/postgres/postgres.git "$PG_SRC"
           meson setup "$PG_BUILD" "$PG_SRC" \
             --prefix="$PG_PREFIX" \
