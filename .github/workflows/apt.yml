@@ -6,6 +6,7 @@ on:
     tags: ['v*']
   pull_request:
     paths:
+      - META.json
       - packaging/apt/**
       - apt/**
       - Makefile
@@ -44,7 +45,8 @@ jobs:
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             ver="${GITHUB_REF_NAME#v}"
           else
-            base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || echo '0.2.0')
+            meta_ver=$(sed -nE 's/^[[:blank:]]*"version"[[:blank:]]*:[[:blank:]]*"([^"]+)".*/\1/p' META.json | head -n 1)
+            base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || echo "${meta_ver:-0.2.0}")
             rev=$(git rev-list --count "v${base}..HEAD" 2>/dev/null || echo '0')
             if [ "$rev" -gt 0 ]; then
               ver="${base}.${rev}"
@@ -79,7 +81,7 @@ jobs:
       - name: Test clean .deb installation in ${{ matrix.image }}
         run: |
           set -euo pipefail
-          docker run --rm \
+          docker run --rm --shm-size=512m \
             -v "$PWD/dist/${{ matrix.codename }}:/debs:ro" \
             -e PG_MAJOR="${{ matrix.pg_major }}" \
             -e CODENAME="${{ matrix.codename }}" \
@@ -117,6 +119,9 @@ jobs:
   publish-apt:
     needs: build-deb
     if: ${{ github.event_name != 'pull_request' }}
+    concurrency:
+      group: publish-apt-gh-pages
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

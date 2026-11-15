@@ -1,7 +1,7 @@
 <h1 align="center">pgvectorfast</h1>
 <p align="center"><strong>pgvectorfast is a high-performance drop-in enhancement for <a href="PGVECTOR.md">pgvector</a> that accelerates vector similarity search and analytical queries in PostgreSQL using a fast shared buffer pool.</strong></p>
 
-Based on [pgvector v0.8.7](https://github.com/pgvector/pgvector/releases/tag/v0.8.7), pgvectorfast installs as a standard PostgreSQL extension (`vectorfast.so`) on unmodified PostgreSQL 18 and 19 servers (Linux x86-64)—no PostgreSQL source patches or server recompilation required. It preserves complete SQL and on-disk compatibility with all `pgvector` data types (`vector`, `halfvec`, `bit`, `sparsevec`), distance operators, and index types (`hnsw`, `ivfflat`). See the [pgvector Documentation](PGVECTOR.md) for the full SQL API, index parameters, and usage guide.
+Based on [pgvector](https://github.com/pgvector/pgvector/), pgvectorfast is a standard PostgreSQL extension on unmodified PostgreSQL 18 and 19 servers for fast vector similarity search.  It preserves complete SQL and on-disk compatibility with all `pgvector` data types (`vector`, `halfvec`, `bit`, `sparsevec`), distance operators, and index types (`hnsw`, `ivfflat`). See the [pgvector Documentation](PGVECTOR.md) for the full SQL API, index parameters, and usage guide.
 
 ## Benchmark Results
 
@@ -74,6 +74,24 @@ sudo apt-get install -y postgresql-18-pgvectorfast
 ```
 
 3. Continue with [Quick Start](#quick-start) to preload `vectorfast` in `postgresql.conf` and activate Calico.
+
+### PGXN
+
+Install from [PGXN](https://pgxn.org/dist/pgvectorfast) using `pgxnclient`. Because PGXN compiles from source against your PostgreSQL installation, first ensure you have PostgreSQL 18 or 19 development headers (`pg_config`), non-LTO server symbols (such as `postgresql-18-dbgsym` on Debian PGDG, or an unstripped source build), `libcapstone-dev` (or Python `pip`), a C compiler, and GNU Make:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y pgxnclient build-essential libcapstone-dev postgresql-server-dev-18 postgresql-18-dbgsym
+sudo pgxn install pgvectorfast
+```
+
+If your target `pg_config` is not first on `PATH` (or you build as an unprivileged user), pass `--pg_config` and `--sudo`:
+
+```sh
+pgxn install --sudo --pg_config /path/to/pg_config pgvectorfast
+```
+
+Continue with [Quick Start](#quick-start) to preload `vectorfast` in `postgresql.conf` and activate Calico.
 
 ### Build and Install from Source
 

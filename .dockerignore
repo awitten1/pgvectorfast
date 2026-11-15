@@ -2,6 +2,7 @@
 .github
 apt/
 debian/
+dist/
 Dockerfile
 .dockerignore
 *.o

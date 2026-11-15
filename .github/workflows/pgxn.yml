@@ -1,0 +1,194 @@
+name: pgxn
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - META.json
+      - Makefile
+      - '*.control'
+      - 'src/**'
+      - 'sql/**'
+      - 'test/**'
+      - 'examples/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'PGVECTOR.md'
+      - 'BENCHMARKS.md'
+      - 'LICENSE'
+      - '.github/workflows/pgxn.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Upload distribution archive to PGXN Manager'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  package-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release metadata and build PGXN distribution archive
+        id: bundle
+        run: |
+          set -euo pipefail
+          readarray -t meta < <(python3 -c '
+          import json, os, re
+          with open("META.json", encoding="utf-8") as f:
+              data = json.load(f)
+          name = data["name"]
+          ver = data["version"]
+          assert name == "pgvectorfast", f"unexpected name: {name}"
+          semver_re = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
+          assert semver_re.match(ver), f"META.json version is not valid SemVer: {ver}"
+          for ext, info in data.get("provides", {}).items():
+              ext_ver = info["version"]
+              ext_file = info["file"]
+              assert semver_re.match(ext_ver), f"provides.{ext}.version is not valid SemVer: {ext_ver}"
+              assert os.path.isfile(ext_file), f"missing provides.{ext}.file: {ext_file}"
+              docfile = info.get("docfile")
+              if docfile:
+                  assert os.path.isfile(docfile), f"missing provides.{ext}.docfile: {docfile}"
+          print(name)
+          print(ver)
+          ')
+          distname="${meta[0]}"
+          distver="${meta[1]}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            tag_ver="${GITHUB_REF_NAME#v}"
+            if [[ "${distver}" != "${tag_ver}" ]]; then
+              echo "::error::META.json version (${distver}) does not match release tag (${tag_ver}). Update META.json before tagging."
+              exit 1
+            fi
+          fi
+          zipfile="dist/${distname}-${distver}.zip"
+          mkdir -p dist
+          git archive --format zip --prefix="${distname}-${distver}/" --output "${zipfile}" HEAD
+          test -f "${zipfile}"
+          python3 -c '
+          import sys, zipfile
+          zpath, prefix = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(zpath) as zf:
+              assert f"{prefix}/META.json" in zf.namelist(), f"{prefix}/META.json not in archive"
+          ' "${zipfile}" "${distname}-${distver}"
+          echo "zipfile=${zipfile}" >> "$GITHUB_OUTPUT"
+      - name: Validate META.json with PGXN::Meta::Validator and test pgxn install/check/load/uninstall
+        run: |
+          set -euo pipefail
+          test_script="$(mktemp)"
+          trap 'rm -f "${test_script}"' EXIT
+          cat > "${test_script}" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates gnupg >/dev/null
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+          apt-get update -qq
+          apt-get install -y -qq \
+            build-essential cpanminus libcapstone-dev pgxnclient pkg-config \
+            "postgresql-${PG_MAJOR}" "postgresql-${PG_MAJOR}-dbgsym" "postgresql-server-dev-${PG_MAJOR}" >/dev/null
+
+          cpanm --notest PGXN::Meta::Validator >/dev/null
+          (cd /src && validate_pgxn_meta)
+
+          PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
+          pgxn install --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}"
+
+          su - postgres -c "PG_MAJOR=${PG_MAJOR} PG_CONFIG=${PG_CONFIG} PGXN_ZIP=${PGXN_ZIP} bash -euo pipefail" <<'PG_EOF'
+          export PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
+          export PGHOST=/tmp
+          export PGUSER=postgres
+          export PGDATABASE=postgres
+          PGDATA=/tmp/pgdata
+          initdb -D "${PGDATA}" --no-locale -E UTF8 >/dev/null
+          {
+            echo "listen_addresses = ''"
+            echo "unix_socket_directories = '/tmp'"
+            echo "shared_preload_libraries = 'vectorfast'"
+          } >> "${PGDATA}/postgresql.conf"
+          pg_ctl -D "${PGDATA}" -l /tmp/pg.log -w start
+          trap 'pg_ctl -D "${PGDATA}" -m fast -w stop || true' EXIT
+
+          pgxn check --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}"
+          pgxn load --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}"
+
+          psql -h /tmp -d postgres -v ON_ERROR_STOP=1 <<'SQL_EOF'
+          CREATE EXTENSION IF NOT EXISTS vector;
+          CALL calico.activate();
+          DO $$
+          BEGIN
+            IF calico.status() <> 'calico' THEN
+              RAISE EXCEPTION 'unexpected calico status: %', calico.status();
+            END IF;
+          END $$;
+          CREATE TABLE pgxn_smoke (id bigserial PRIMARY KEY, embedding vector(3));
+          INSERT INTO pgxn_smoke (embedding) VALUES ('[1,0,0]'), ('[0,1,0]'), ('[0,0,1]');
+          CREATE INDEX ON pgxn_smoke USING hnsw (embedding vector_l2_ops);
+          SELECT id FROM pgxn_smoke ORDER BY embedding <-> '[1,0,0]' LIMIT 1;
+          SQL_EOF
+
+          pgxn unload --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}"
+          psql -h /tmp -d postgres -v ON_ERROR_STOP=1 -c "DROP TABLE pgxn_smoke; DROP EXTENSION vector;"
+          PG_EOF
+
+          pgxn uninstall --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}"
+          test ! -e "$("${PG_CONFIG}" --pkglibdir)/vectorfast.so"
+          test ! -e "$("${PG_CONFIG}" --sharedir)/extension/calico.control"
+          test ! -e "$("${PG_CONFIG}" --sharedir)/extension/vector.control"
+          EOF
+          chmod +x "${test_script}"
+          docker run --rm --shm-size=512m \
+            -v "$PWD:/src:ro" \
+            -v "${test_script}:/tmp/pgxn-test.sh:ro" \
+            -e PG_MAJOR=18 \
+            -e CODENAME=trixie \
+            -e PGXN_ZIP="/src/${{ steps.bundle.outputs.zipfile }}" \
+            debian:trixie \
+            bash /tmp/pgxn-test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgxn-dist
+          path: ${{ steps.bundle.outputs.zipfile }}
+
+  publish:
+    needs: package-and-test
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish == true) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pgxn-dist
+          path: dist
+      - name: Upload distribution archive to PGXN Manager
+        env:
+          PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
+          PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PGXN_USERNAME:-}" ] || [ -z "${PGXN_PASSWORD:-}" ]; then
+            echo "::error::PGXN_USERNAME and PGXN_PASSWORD secrets must be configured in repository Settings -> Secrets and variables -> Actions"
+            exit 1
+          fi
+          zipfile=$(ls dist/*.zip | head -n 1)
+          test -f "${zipfile}"
+          echo "Uploading ${zipfile} to PGXN Manager..."
+          status=$(curl --user "${PGXN_USERNAME}:${PGXN_PASSWORD}" \
+            -F 'submit=Release It!' \
+            -F "archive=@${zipfile}" \
+            -H 'X-Requested-With: XMLHttpRequest' \
+            --silent \
+            --output /tmp/pgxn-upload-response.txt \
+            --write-out "%{http_code}" \
+            https://manager.pgxn.org/upload)
+          cat /tmp/pgxn-upload-response.txt
+          echo
+          if [ "${status}" -ne 200 ]; then
+            echo "::error::PGXN upload failed with HTTP status ${status}"
+            exit 1
+          fi
