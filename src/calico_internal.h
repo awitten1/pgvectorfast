@@ -58,7 +58,44 @@ static inline bool   CalicoIsValid   (uint64 entry) { return (CalicoGetState(ent
 static inline bool   CalicoIsLocked  (uint64 entry) { return (CalicoGetState(entry) & CALICO_STATE_LOCKED) != 0; }
 
 typedef CalicoTranslationEntry *SecondLevelTable;
-#define CALICO_REGION_MASK 0x00ffffffU
+
+/*
+ * Dynamic shared-memory translation layout (Design 1):
+ * - CALICO_REGION_BITS = 26 gives 2^26 entries (512 MiB per second-level array),
+ *   spanning 512 GiB of PostgreSQL 8 KiB relation blocks per prefix node.
+ * - Cross-process shared structures (prefix buckets/nodes and calico_frame_entries)
+ *   never store raw pointers because sibling backends attach /dev/shm extents
+ *   independently with mmap(NULL) on first touch. Instead they store a 64-bit
+ *   relocatable token: ((ext_id + 1) << 48) | byte_offset (0 = null token).
+ * - Each backend caches its own local raw pointers in calico_local_extents[],
+ *   CalicoPathCache, and CalicoReadHandle, preserving zero-indirection reads.
+ */
+#define CALICO_REGION_BITS      26
+#define CALICO_REGION_ENTRIES   (UINT64CONST(1) << CALICO_REGION_BITS)
+#define CALICO_REGION_MASK      ((uint32) (CALICO_REGION_ENTRIES - 1))
+#define CALICO_REGION_BYTES     ((Size) (CALICO_REGION_ENTRIES * sizeof(pg_atomic_uint64)))
+#define CALICO_MAX_EXTENTS      65535U
+#define CALICO_TOKEN_EXT_SHIFT  48
+#define CALICO_TOKEN_OFF_MASK   UINT64CONST(0x0000FFFFFFFFFFFF)
+
+static inline uint64
+CalicoMakeToken(uint32 ext_id, uint64 byte_off)
+{
+    return (((uint64) (ext_id + 1U)) << CALICO_TOKEN_EXT_SHIFT) |
+           (byte_off & CALICO_TOKEN_OFF_MASK);
+}
+
+static inline uint32
+CalicoTokenExtId(uint64 tok)
+{
+    return (uint32) ((tok >> CALICO_TOKEN_EXT_SHIFT) - 1U);
+}
+
+static inline uint64
+CalicoTokenOffset(uint64 tok)
+{
+    return tok & CALICO_TOKEN_OFF_MASK;
+}
 #if PG_VERSION_NUM >= 190000
 typedef uint64 CalicoBufferState;
 #define CALICO_READ_BUFFER_STATE(buf) calico_load_entry(&(buf)->state)
@@ -114,7 +151,6 @@ calico_is_active(void)
 {
     return calico_local_active;
 }
-extern int calico_max_regions;
 extern void calico_pool_request(void);
 extern void calico_pool_startup(void);
 extern void calico_pool_seed(void);
@@ -124,17 +160,33 @@ extern int calico_table_insert(BufferTag *tag, uint32 hashcode, int frame);
 extern void calico_table_delete(BufferTag *tag, uint32 hashcode);
 extern void calico_table_delete_frame(BufferTag *tag, uint32 hashcode, int buf_id);
 extern __attribute__((visibility("hidden"))) pg_atomic_uint64 *calico_frame_entries;
+extern __attribute__((visibility("hidden"))) char *calico_local_extents[CALICO_MAX_EXTENTS];
 
+/*
+ * Decode the packed (ext_id, byte_off) token stored in calico_frame_entries[buf_id]
+ * through this backend's local extent base table. If this backend has not yet
+ * attached ext_id lazily, skip speculative prefetch cleanly.
+ */
 static inline __attribute__((always_inline)) void
 calico_prefetch_victim_entry(int buf_id)
 {
     if (calico_local_active && calico_frame_entries != NULL)
     {
-        uintptr_t addr = (uintptr_t) __atomic_load_n(&calico_frame_entries[buf_id].value,
-                                                     __ATOMIC_RELAXED);
+        uint64 tok = __atomic_load_n(&calico_frame_entries[buf_id].value,
+                                     __ATOMIC_RELAXED);
 
-        if (addr != 0)
-            __builtin_prefetch((const void *) addr, 1, 3);
+        if (tok != 0)
+        {
+            uint32 ext_id = CalicoTokenExtId(tok);
+
+            if (likely(ext_id < CALICO_MAX_EXTENTS))
+            {
+                char  *base = calico_local_extents[ext_id];
+
+                if (likely(base != NULL))
+                    __builtin_prefetch(base + CalicoTokenOffset(tok), 1, 3);
+            }
+        }
     }
 }
 typedef struct CalicoPrefix
@@ -150,6 +202,7 @@ typedef struct CalicoPathCache
 {
     CalicoPrefix prefix;
     pg_atomic_uint64 *array;
+    uint64 array_tok;
     bool valid;
 } CalicoPathCache;
 
@@ -167,7 +220,7 @@ calico_entry_for(const BufferTag *tag, bool create)
         calico_path_cache.prefix.database == tag->dbOid &&
         calico_path_cache.prefix.relation == tag->relNumber &&
         calico_path_cache.prefix.fork == tag->forkNum &&
-        calico_path_cache.prefix.region == (tag->blockNum >> 24))
+        calico_path_cache.prefix.region == (tag->blockNum >> CALICO_REGION_BITS))
         return calico_path_cache.array + (tag->blockNum & CALICO_REGION_MASK);
     return calico_entry_for_miss(tag, create);
 }
@@ -196,7 +249,7 @@ calico_read_handle_init(CalicoReadHandle *handle,
 static pg_noinline pg_attribute_unused() CalicoTranslationEntry *
 calico_read_handle_entry_miss(CalicoReadHandle *handle, BlockNumber block)
 {
-    uint32 region = block >> 24;
+    uint32 region = block >> CALICO_REGION_BITS;
     CalicoTranslationEntry *entry;
     BufferTag tag;
 
@@ -213,7 +266,7 @@ calico_read_handle_entry_miss(CalicoReadHandle *handle, BlockNumber block)
 static inline __attribute__((always_inline)) CalicoTranslationEntry *
 calico_read_handle_entry(CalicoReadHandle *handle, BlockNumber block)
 {
-    uint32 region = block >> 24;
+    uint32 region = block >> CALICO_REGION_BITS;
 
     if (likely(handle->array && handle->region == region))
         return handle->array + (block & CALICO_REGION_MASK);
@@ -464,7 +517,7 @@ calico_optimistic_lookup_batch_handle(CalicoReadHandle *handle,
             foundOut[k] = false;
         return;
     }
-    if (unlikely(!handle->array || handle->region != (blockNums[0] >> 24)))
+    if (unlikely(!handle->array || handle->region != (blockNums[0] >> CALICO_REGION_BITS)))
     {
         if (unlikely(!calico_read_handle_entry(handle, blockNums[0])))
         {
@@ -480,7 +533,7 @@ calico_optimistic_lookup_batch_handle(CalicoReadHandle *handle,
         }
     }
     table = handle->array;
-    base_mask = handle->region << 24;
+    base_mask = handle->region << CALICO_REGION_BITS;
 
     for (; i + 3 < count; i += 4)
     {
@@ -490,7 +543,7 @@ calico_optimistic_lookup_batch_handle(CalicoReadHandle *handle,
         BlockNumber b3 = blockNums[i + 3];
 
         if (likely((((b0 ^ base_mask) | (b1 ^ base_mask) |
-                     (b2 ^ base_mask) | (b3 ^ base_mask)) >> 24) == 0))
+                     (b2 ^ base_mask) | (b3 ^ base_mask)) >> CALICO_REGION_BITS) == 0))
         {
             uint64 v0 = calico_load_entry(&table[b0 & CALICO_REGION_MASK]);
             uint64 v1 = calico_load_entry(&table[b1 & CALICO_REGION_MASK]);
@@ -519,7 +572,7 @@ calico_optimistic_lookup_batch_handle(CalicoReadHandle *handle,
             if (handle->array)
             {
                 table = handle->array;
-                base_mask = handle->region << 24;
+                base_mask = handle->region << CALICO_REGION_BITS;
             }
         }
     }
@@ -529,7 +582,7 @@ calico_optimistic_lookup_batch_handle(CalicoReadHandle *handle,
         CalicoTranslationEntry *e;
         uint64 v;
 
-        if (likely((b >> 24) == (base_mask >> 24)))
+        if (likely((b >> CALICO_REGION_BITS) == (base_mask >> CALICO_REGION_BITS)))
             e = &table[b & CALICO_REGION_MASK];
         else
             e = calico_read_handle_entry(handle, b);
@@ -551,7 +604,7 @@ typedef struct CalicoOptimisticSlot
 static inline __attribute__((always_inline)) void
 calico_optimistic_prefetch_block(const CalicoReadHandle *handle, BlockNumber blockNum)
 {
-    if (likely(handle->array != NULL && handle->region == (blockNum >> 24)))
+    if (likely(handle->array != NULL && handle->region == (blockNum >> CALICO_REGION_BITS)))
         __builtin_prefetch(&handle->array[blockNum & CALICO_REGION_MASK], 0, 3);
 }
 
@@ -609,11 +662,11 @@ calico_optimistic_lookup_batch_slots_impl(CalicoReadHandle *handle,
     int i = 0;
 
     if (unlikely(!calico_local_active || count <= 0 ||
-                 !handle->array || handle->region != (blockNums[0] >> 24)))
+                 !handle->array || handle->region != (blockNums[0] >> CALICO_REGION_BITS)))
         return calico_optimistic_lookup_batch_slots_slow(handle, blockNums, count, slotsOut);
 
     table = handle->array;
-    base_mask = handle->region << 24;
+    base_mask = handle->region << CALICO_REGION_BITS;
 
     if (do_prefetch)
     {
@@ -625,7 +678,7 @@ calico_optimistic_lookup_batch_slots_impl(CalicoReadHandle *handle,
             BlockNumber p3 = blockNums[k + 3];
 
             if (likely((((p0 ^ base_mask) | (p1 ^ base_mask) |
-                         (p2 ^ base_mask) | (p3 ^ base_mask)) >> 24) == 0))
+                         (p2 ^ base_mask) | (p3 ^ base_mask)) >> CALICO_REGION_BITS) == 0))
             {
                 __builtin_prefetch(&table[p0 & CALICO_REGION_MASK], 0, 3);
                 __builtin_prefetch(&table[p1 & CALICO_REGION_MASK], 0, 3);
@@ -637,7 +690,7 @@ calico_optimistic_lookup_batch_slots_impl(CalicoReadHandle *handle,
         {
             BlockNumber p = blockNums[k];
 
-            if (likely((p >> 24) == (base_mask >> 24)))
+            if (likely((p >> CALICO_REGION_BITS) == (base_mask >> CALICO_REGION_BITS)))
                 __builtin_prefetch(&table[p & CALICO_REGION_MASK], 0, 3);
         }
     }
@@ -650,7 +703,7 @@ calico_optimistic_lookup_batch_slots_impl(CalicoReadHandle *handle,
         BlockNumber b3 = blockNums[i + 3];
 
         if (unlikely((((b0 ^ base_mask) | (b1 ^ base_mask) |
-                       (b2 ^ base_mask) | (b3 ^ base_mask)) >> 24) != 0))
+                       (b2 ^ base_mask) | (b3 ^ base_mask)) >> CALICO_REGION_BITS) != 0))
         {
             bool slow_res = calico_optimistic_lookup_batch_slots_slow(handle,
                                                                       blockNums + i,
@@ -744,7 +797,7 @@ calico_optimistic_lookup_batch_slots_impl(CalicoReadHandle *handle,
         uint64 v;
         uint32 f;
 
-        if (unlikely((b >> 24) != (base_mask >> 24)))
+        if (unlikely((b >> CALICO_REGION_BITS) != (base_mask >> CALICO_REGION_BITS)))
         {
             bool slow_res = calico_optimistic_lookup_batch_slots_slow(handle,
                                                                       blockNums + i,

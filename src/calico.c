@@ -58,8 +58,6 @@ CalicoInit(void)
         if (PG_VERSION_NUM < 180000 || PG_VERSION_NUM >= 200000 ||
             strcmp(PG_VERSION, GetConfigOption("server_version", false, false)))
             elog(FATAL, "Calico requires a PostgreSQL 18 or 19 executable matching its build headers");
-        DefineCustomIntVariable("calico.max_regions", "Reserved 128 MiB translation regions.",
-            NULL, &calico_max_regions, 8192, 1, 65536, PGC_POSTMASTER, 0, NULL, NULL, NULL);
         calico_register_worker();
         previous_request = shmem_request_hook;
         shmem_request_hook = calico_request;
