@@ -44,7 +44,7 @@ jobs:
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             ver="${GITHUB_REF_NAME#v}"
           else
-            base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || echo '0.1.0')
+            base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || echo '0.2.0')
             rev=$(git rev-list --count "v${base}..HEAD" 2>/dev/null || echo '0')
             if [ "$rev" -gt 0 ]; then
               ver="${base}.${rev}"
