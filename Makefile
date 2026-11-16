@@ -2,6 +2,7 @@ srcdir ?= $(patsubst %/,%,$(dir $(firstword $(MAKEFILE_LIST))))
 
 EXTENSION = vector calico vectorfast
 EXTVERSION = 0.8.7
+DISTVERSION = $(shell sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' $(srcdir)/META.json | head -n 1)
 
 MODULE_big = vectorfast
 DATA = $(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/sql/*--*--*.sql))
@@ -118,4 +119,4 @@ prove_installcheck:
 
 dist:
 	mkdir -p dist
-	git archive --format zip --prefix=pgvectorfast-$(EXTVERSION)/ --output dist/pgvectorfast-$(EXTVERSION).zip HEAD
+	git archive --format zip --prefix=pgvectorfast-$(DISTVERSION)/ --output dist/pgvectorfast-$(DISTVERSION).zip HEAD
