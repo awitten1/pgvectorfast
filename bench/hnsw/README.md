@@ -119,6 +119,10 @@ across engines for the same dataset and memory budget.
 ```
 
 This exports the two HNSW charts, a CSV summary, and Markdown result tables.
+When `chroma-paging/` is present in the results directory, the charts use its
+latest Chroma in-memory and paging measurements, with the swap settings labeled
+on the larger-than-memory figure. The CSV and tables retain the original
+four-system no-swap results.
 
 All four README figures share the fonts, colors, and layout helpers in
 `bench/plot_style.py`. Regenerate the IVFFlat and analytical-query figures from
@@ -127,3 +131,6 @@ their recorded historical values in `bench/figure_data.json` with:
 ```sh
 /tmp/hnsw-venv/bin/python bench/plot_other_figures.py --assets assets
 ```
+
+The figures use Noto Sans from GitHub's Markdown font stack. Install it before
+rendering (`fonts-noto-core` on Debian/Ubuntu).

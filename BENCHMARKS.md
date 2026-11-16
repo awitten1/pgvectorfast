@@ -4,6 +4,11 @@ The HNSW comparison uses pgvectorfast 0.2.1, upstream pgvector 0.8.7,
 Chroma 1.5.9, and Qdrant 1.20.1 on the same SIFT10M (128D) and DEEP10M (96D)
 vectors. The IVFFlat and SQL operator results below are from earlier runs.
 
+The README figures use the latest Chroma rerun: 855.1 / 856.7 QPS at 16 GiB RAM
+and 14.2 / 13.6 QPS at 2 GiB RAM with 16 GiB of NVMe swap (SIFT10M / DEEP10M).
+The other systems' plotted measurements used no swap. The original no-swap
+tables are retained below, followed by the Chroma rerun's full results.
+
 ## HNSW setup
 
 - Hardware: Intel Core i9-13900K, 62 GiB host RAM, Samsung 980 PRO NVMe.

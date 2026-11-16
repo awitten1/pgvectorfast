@@ -32,7 +32,7 @@ def plot_ivfflat(data, assets):
                 reduction = 100 * (1 - value / row['pgvector_median_ms'])
                 text += f'\n(-{reduction:.1f}%)'
             ax.text(bar.get_x() + bar.get_width()/2, value + peak*.018,
-                    text, ha='center', va='bottom', fontsize=10)
+                    text, ha='center', va='bottom', fontsize=12)
     ax.set_xticks(xs, [f"{r['name']} ({r['dimensions']}D)\n"
                       f"Recall@3 = {r['recall_at_3']:.2f}" for r in datasets])
     ax.set_ylabel('Median query latency (ms)')
@@ -54,7 +54,7 @@ def plot_analytical(data, assets):
         last = bars[-1]
         ax.text(last.get_x()+last.get_width()/2, last.get_height()+.05,
                 f'{last.get_height():.2f}x', ha='center', va='bottom',
-                rotation=90, fontsize=10)
+                rotation=90, fontsize=12)
     ax.axhline(1, color='#555555', linestyle='--', linewidth=1.1,
                label='Stock PostgreSQL (1.00x)', zorder=4)
     ax.set_xticks(xs, [str(n) for n in sizes])

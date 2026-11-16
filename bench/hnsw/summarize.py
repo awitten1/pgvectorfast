@@ -15,9 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from plot_style import PALETTE, apply_style, new_chart, add_legend, save_chart
 
 STORES = ['pgvector', 'pgvectorfast', 'chroma', 'qdrant']
+CHART_STORES = ['pgvector', 'chroma', 'qdrant', 'pgvectorfast']
 NAMES = {'pgvector': 'pgvector', 'pgvectorfast': 'pgvectorfast',
          'chroma': 'Chroma', 'qdrant': 'Qdrant'}
-COLORS = PALETTE[:4]
+COLORS = [PALETTE[i] for i in (0, 2, 3, 1)]
 DATASETS = ['sift10m', 'deep10m']
 
 
@@ -76,6 +77,45 @@ def summarize(root):
     return rows
 
 
+def chart_results(root, rows):
+    """Use the Chroma rerun in figures; retain the original no-swap tables."""
+    selected = [dict(row) for row in rows]
+    rerun = root / 'chroma-paging'
+    if not rerun.is_dir():
+        return selected, False
+    for row in selected:
+        if row['store'] != 'chroma':
+            continue
+        mode = 'inmem' if row['mode'] == 'inmem' else 'paging'
+        result = json.loads((rerun / f"chroma-{row['dataset']}-{mode}.json").read_text())
+        assert result['outcome'] == 'ok'
+        assert result['count'] == 10_000_000
+        assert result['query_order_seed'] == 20261115
+        assert result['ef_search'] == row['ef_search']
+        assert result['query_range'] == [4000, 10000 if mode == 'inmem' else 5000]
+        assert len(result['repeats']) == 3
+        assert {r['queries'] for r in result['repeats']} == {6000 if mode == 'inmem' else 1000}
+        recalls = [r['recall_at_10'] for r in result['repeats']]
+        assert max(recalls) - min(recalls) <= .001
+        for stats in (result['memory_before'], result['memory_after']):
+            assert int(stats['memory.max']) == (16 if mode == 'inmem' else 2) * 1024**3
+            assert int(stats['memory.swap.max']) == (0 if mode == 'inmem' else 16) * 1024**3
+        if mode == 'paging':
+            assert int(result['memory_after']['memory.swap.current']) > 0
+            assert result['timed_read_bytes'] >= 64 * 1024**2
+        row['outcome'] = 'ok'
+        for field in ('qps', 'mean_ms', 'median_ms', 'p95_ms', 'p99_ms', 'recall_at_10'):
+            row[field] = statistics.median(r[field] for r in result['repeats'])
+        row['qps_min'] = min(r['qps'] for r in result['repeats'])
+        row['qps_max'] = max(r['qps'] for r in result['repeats'])
+    for dataset in DATASETS:
+        for mode in ('inmem', 'oom'):
+            recalls = [r['recall_at_10'] for r in selected
+                       if r['dataset'] == dataset and r['mode'] == mode]
+            assert max(recalls) - min(recalls) <= .01
+    return selected, True
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--results', type=Path, required=True)
@@ -107,15 +147,16 @@ def main():
         lines += ['']
     (a.results / 'tables.md').write_text('\n'.join(lines))
     a.assets.mkdir(parents=True, exist_ok=True)
+    plotted, has_paging = chart_results(a.results, rows)
     apply_style()
-    for mode, title, budget in [('inmem', 'In-Memory HNSW', '16 GiB per service'),
-                                ('oom', 'Larger-Than-Memory HNSW', '2 GiB per service, OS swap disabled')]:
+    for mode, title, budget in [('inmem', 'In-Memory HNSW', '16 GiB RAM'),
+                                ('oom', 'Larger-Than-Memory HNSW', '2 GiB RAM')]:
         fig, ax = new_chart(title, budget)
         xpos = np.arange(2)
         width = .19
-        peak = max(r.get('qps', 0) for r in rows if r['mode'] == mode)
-        for j, store in enumerate(STORES):
-            selected = [next(r for r in rows if r['mode'] == mode
+        peak = max(r.get('qps', 0) for r in plotted if r['mode'] == mode)
+        for j, store in enumerate(CHART_STORES):
+            selected = [next(r for r in plotted if r['mode'] == mode
                         and r['dataset'] == ds and r['store'] == store) for ds in DATASETS]
             values = [r.get('qps', float('nan')) for r in selected]
             ranges = [[r['qps'] - r['qps_min'] if r['outcome'] == 'ok' else 0 for r in selected],
@@ -125,15 +166,21 @@ def main():
                           yerr=ranges, error_kw={'capsize': 3, 'elinewidth': 1}, zorder=3)
             for x, bar, r in zip(xs, bars, selected):
                 if r['outcome'] == 'ok':
-                    ax.text(x, bar.get_height()+peak*.018, f"{r['qps']:,.0f}",
-                            ha='center', va='bottom', fontsize=10)
+                    label = f"{r['qps']:,.1f}" if mode == 'oom' else f"{r['qps']:,.0f}"
+                    ax.text(x, bar.get_height()+peak*.018, label,
+                            ha='center', va='bottom', fontsize=12)
                 else:
                     ax.text(x, peak*.025, 'OOM', ha='center', va='bottom',
-                            color=COLORS[j], weight='bold', fontsize=11)
+                            color=COLORS[j], weight='bold', fontsize=12)
         ax.set_ylabel('QPS (median of 3 repeats)')
         ax.set_xticks(xpos, ['SIFT10M', 'DEEP10M'])
         ax.set_ylim(0, peak*1.18)
         add_legend(ax, 4)
+        if mode == 'oom':
+            note = ('Chroma: 16 GiB NVMe swap; other systems: swap disabled'
+                    if has_paging else 'OS swap disabled')
+            ax.text(.5, -.24, note, transform=ax.transAxes,
+                    ha='center', va='top', fontsize=12)
         save_chart(fig, a.assets / f'hnsw_{mode}.png')
 
 

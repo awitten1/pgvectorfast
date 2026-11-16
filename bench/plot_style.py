@@ -7,11 +7,11 @@ BASELINE_COLOR, FAST_COLOR = PALETTE[:2]
 
 def apply_style():
     plt.rcParams.update({
-        'font.family': 'DejaVu Sans', 'font.size': 12,
-        'axes.titlesize': 17, 'axes.titleweight': 'normal',
-        'axes.labelsize': 12, 'axes.labelweight': 'normal',
-        'xtick.labelsize': 12, 'ytick.labelsize': 12,
-        'legend.fontsize': 12, 'legend.frameon': False,
+        'font.family': 'Noto Sans', 'font.size': 15,
+        'axes.titlesize': 20, 'axes.titleweight': 'semibold',
+        'axes.labelsize': 15, 'axes.labelweight': 'normal',
+        'xtick.labelsize': 15, 'ytick.labelsize': 15,
+        'legend.fontsize': 14, 'legend.frameon': False,
         'figure.facecolor': 'white', 'axes.facecolor': 'white',
         'axes.edgecolor': 'black', 'axes.linewidth': .8,
         'axes.spines.top': False, 'axes.spines.right': False,
@@ -24,7 +24,7 @@ def apply_style():
 
 def new_chart(title, subtitle):
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.set_title(f'{title}\n{subtitle}', fontsize=17, pad=18)
+    ax.set_title(f'{title}\n{subtitle}', pad=18)
     ax.grid(axis='y', alpha=.18, zorder=0)
     return fig, ax
 
