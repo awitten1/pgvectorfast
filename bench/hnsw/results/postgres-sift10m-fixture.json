@@ -1,0 +1,19 @@
+{
+  "dataset": "sift10m",
+  "count": 10000000,
+  "min_id": 1,
+  "max_id": 10000000,
+  "embedding_type": "vector(128)",
+  "vector_version": "0.8.7",
+  "heap_bytes": 5851611136,
+  "hnsw_bytes": 8303353856,
+  "index_options": [
+    "m=16",
+    "ef_construction=64"
+  ],
+  "index_definition": "CREATE INDEX sift10m_hnsw_idx ON public.sift10m_vectors USING hnsw (embedding vector_l2_ops) WITH (m='16', ef_construction='64')",
+  "shared_by": [
+    "pgvector",
+    "pgvectorfast"
+  ]
+}

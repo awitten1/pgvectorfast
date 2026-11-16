@@ -8,10 +8,10 @@ Based on [pgvector](https://github.com/pgvector/pgvector/), pgvectorfast is a st
 <table>
   <tr>
     <td width="50%" valign="top">
-      <a href="assets/hnsw_inmem.png"><img src="assets/hnsw_inmem.png" alt="In-Memory HNSW Throughput (QPS): pgvector vs pgvectorfast" width="100%" /></a>
+      <a href="assets/hnsw_inmem.png"><img src="assets/hnsw_inmem.png" alt="In-Memory HNSW Throughput (QPS): pgvector, pgvectorfast, Chroma, and Qdrant" width="100%" /></a>
     </td>
     <td width="50%" valign="top">
-      <a href="assets/hnsw_oom.png"><img src="assets/hnsw_oom.png" alt="Larger-Than-Memory HNSW Throughput (QPS): pgvector vs pgvectorfast" width="100%" /></a>
+      <a href="assets/hnsw_oom.png"><img src="assets/hnsw_oom.png" alt="Larger-Than-Memory HNSW Throughput (QPS): pgvector, pgvectorfast, Chroma, and Qdrant" width="100%" /></a>
     </td>
   </tr>
   <tr>
@@ -24,7 +24,7 @@ Based on [pgvector](https://github.com/pgvector/pgvector/), pgvectorfast is a st
   </tr>
 </table>
 
-See [Detailed Benchmark Results](BENCHMARKS.md) for latency breakdowns, ablation tables, and experimental configurations.
+See [Detailed Benchmark Results](BENCHMARKS.md) for measured recall, latency breakdowns, and experimental configurations.
 
 ## How It Works
 

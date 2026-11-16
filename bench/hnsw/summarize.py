@@ -83,7 +83,7 @@ def main():
               'qps', 'mean_ms', 'median_ms', 'p95_ms', 'p99_ms', 'qps_min', 'qps_max',
               'timed_read_bytes']
     with (a.results / 'summary.csv').open('w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, lineterminator='\n')
         w.writeheader()
         w.writerows(rows)
     lines = []
@@ -129,7 +129,7 @@ def main():
                     ax.text(x, peak*.025, 'OOM', ha='center', va='bottom',
                             color=COLORS[j], weight='bold', fontsize=11)
         ax.set_title(f'{title}\n{budget}', fontsize=17, pad=18)
-        ax.set_ylabel('Queries per second (median of 3 repeats)')
+        ax.set_ylabel('QPS (median of 3 repeats)')
         ax.set_xticks(xpos, ['SIFT10M', 'DEEP10M'])
         ax.set_ylim(0, peak*1.18)
         ax.grid(axis='y', alpha=.18, zorder=0)

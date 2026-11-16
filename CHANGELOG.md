@@ -6,6 +6,7 @@
 - Test both setup paths and pgvector regressions in packaged installations.
 - Include pgvector SQL upgrade scripts in Docker images.
 - Name source distributions using the pgvectorfast release version.
+- Rerun SIFT10M and DEEP10M HNSW benchmarks against Chroma and Qdrant at matched recall, with reproducible runners and raw results.
 
 ## 0.8.7 (2026-10-01)
 

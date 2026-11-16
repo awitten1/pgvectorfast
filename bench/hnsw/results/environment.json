@@ -1,0 +1,226 @@
+{
+  "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  32\nOn-line CPU(s) list:                     0-31\nVendor ID:                               GenuineIntel\nModel name:                              13th Gen Intel(R) Core(TM) i9-13900K\nCPU family:                              6\nModel:                                   183\nThread(s) per core:                      2\nCore(s) per socket:                      24\nSocket(s):                               1\nStepping:                                1\nCPU max MHz:                             5800.0000\nCPU min MHz:                             800.0000\nBogoMIPS:                                5990.40\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq tme rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities ibpb_exit_to_user\nVirtualization:                          VT-x\nL1d cache:                               896 KiB (24 instances)\nL1i cache:                               1.3 MiB (24 instances)\nL2 cache:                                32 MiB (12 instances)\nL3 cache:                                36 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-31\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Mitigation; Clear Register File\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB before exit to userspace\n",
+  "memory": {
+    "inmem_bytes": 17179869184,
+    "oom_bytes": 2147483648,
+    "swap": false,
+    "pg_shared_buffers_inmem": "14GB",
+    "pg_shared_buffers_oom": "1536MB"
+  },
+  "disk": "TARGET SOURCE         FSTYPE OPTIONS\n/      /dev/nvme0n1p2 ext4   rw,relatime,errors=remount-ro\n",
+  "kernel": {
+    "release": "6.8.0-138-generic",
+    "version": "#138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:43:15 UTC ",
+    "architecture": "x86_64",
+    "system": "Linux"
+  },
+  "client_packages": "annotated-types==0.8.0\nanyio==4.16.0\nattrs==26.1.0\ncertifi==2026.10.23\nchromadb-client==1.5.9\nexceptiongroup==1.3.1\ngoogleapis-common-protos==1.76.0\ngrpcio==1.85.1\nh11==0.16.0\nh2==4.4.1\nh5py==3.16.0\nhpack==4.2.0\nhttpcore==1.0.9\nhttpx==0.28.1\nhyperframe==6.1.0\nidna==3.20\njsonschema==4.26.0\njsonschema-specifications==2025.9.1\nnumpy==2.2.6\nopentelemetry-api==1.45.2\nopentelemetry-exporter-otlp-common==0.66b2\nopentelemetry-exporter-otlp-proto-common==1.45.2\nopentelemetry-exporter-otlp-proto-grpc==1.45.2\nopentelemetry-proto==1.45.2\nopentelemetry-sdk==1.45.2\nopentelemetry-semantic-conventions==0.66b2\norjson==3.13.0\noverrides==7.7.0\npgvector==0.5.1\nportalocker==4.4.2\nprotobuf==7.36.2\npsycopg==3.3.9\npsycopg-binary==3.3.9\npybase64==1.5.2\npydantic==2.14.3\npydantic-settings==2.15.0\npydantic_core==2.50.4\npython-dotenv==1.2.4\nPyYAML==6.0.3\nqdrant-client==1.20.0\nreferencing==0.37.0\nrpds-py==0.30.0\ntenacity==9.2.1\ntyping-inspection==0.4.5\ntyping_extensions==4.16.0\nurllib3==2.8.0\n",
+  "query_split": {
+    "calibration_positions": [
+      0,
+      4000
+    ],
+    "warmup_positions": [
+      0,
+      2000
+    ],
+    "inmem_timed_positions": [
+      4000,
+      10000
+    ],
+    "oom_timed_positions": [
+      4000,
+      5000
+    ]
+  },
+  "target_recall_at_10": {
+    "sift10m": 0.9336,
+    "deep10m": 0.8712
+  },
+  "images": [
+    {
+      "Id": "sha256:a221f3391b5eabc5b0b293b65958a28f10d7015be67e4d8cc33a5e4e60e6f3ca",
+      "RepoTags": [
+        "chromadb/chroma:1.5.9"
+      ],
+      "RepoDigests": [
+        "chromadb/chroma@sha256:1e0b73a187a28757c572acba508c46f48c9e8b0acaf5c20e6d95cdedce1acdf6"
+      ],
+      "Created": "2026-05-05T01:49:45.652638163Z",
+      "Config": {
+        "ExposedPorts": {
+          "8000/tcp": {}
+        },
+        "Env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "ASAN_OPTIONS=",
+          "ASAN_SYMBOLIZER_PATH=",
+          "RUST_BACKTRACE=0"
+        ],
+        "Entrypoint": [
+          "dumb-init",
+          "--",
+          "chroma"
+        ],
+        "Cmd": [
+          "run",
+          "/config.yaml"
+        ],
+        "ArgsEscaped": true
+      },
+      "Architecture": "amd64",
+      "Os": "linux"
+    },
+    {
+      "Id": "sha256:1d9aa857fe7f737a61a695886ddacbb5beb02f8514ea324afe6f066a2ac1db0e",
+      "RepoTags": [
+        "qdrant/qdrant:v1.20.1"
+      ],
+      "RepoDigests": [
+        "qdrant/qdrant@sha256:d18c8e5061be3eaea2f53fbee1f0bf0382dc59cbb9b7112e41ffcc937ec14220"
+      ],
+      "Created": "2026-11-13T11:31:49.461075662Z",
+      "Config": {
+        "User": "0:0",
+        "ExposedPorts": {
+          "6333/tcp": {},
+          "6334/tcp": {}
+        },
+        "Env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "DIR=",
+          "TZ=Etc/UTC",
+          "RUN_MODE=production"
+        ],
+        "Cmd": [
+          "./entrypoint.sh"
+        ],
+        "WorkingDir": "/qdrant",
+        "Labels": {
+          "org.opencontainers.image.description": "Official Qdrant image",
+          "org.opencontainers.image.documentation": "https://qdrant.com/docs",
+          "org.opencontainers.image.source": "https://github.com/qdrant/qdrant",
+          "org.opencontainers.image.title": "Qdrant",
+          "org.opencontainers.image.url": "https://qdrant.com/",
+          "org.opencontainers.image.vendor": "Qdrant",
+          "org.opencontainers.image.version": "v1.20.1"
+        },
+        "ArgsEscaped": true
+      },
+      "Architecture": "amd64",
+      "Os": "linux"
+    },
+    {
+      "Id": "sha256:4fea28126923b2ccea5cbc50ca7f719a4a024a5f8e9afe07633f641fa273bc66",
+      "RepoTags": [
+        "pgvectorfast-021-test:trixie"
+      ],
+      "RepoDigests": [],
+      "Created": "2026-11-15T22:21:10.881436152-05:00",
+      "Config": {
+        "ExposedPorts": {
+          "5432/tcp": {}
+        },
+        "Env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/18/bin",
+          "GOSU_VERSION=1.19",
+          "LANG=en_US.utf8",
+          "PG_MAJOR=18",
+          "PG_VERSION=18.7-1.pgdg13+2",
+          "PGDATA=/var/lib/postgresql/18/docker"
+        ],
+        "Entrypoint": [
+          "docker-entrypoint.sh"
+        ],
+        "Cmd": [
+          "postgres"
+        ],
+        "Volumes": {
+          "/var/lib/postgresql": {}
+        },
+        "StopSignal": "SIGINT"
+      },
+      "Architecture": "amd64",
+      "Os": "linux"
+    },
+    {
+      "Id": "sha256:99288c5c2f567bc820cdff77cb42e1e84d68e83a9926ee6cc07c3273eb279dbb",
+      "RepoTags": [
+        "pgvector-upstream-bench:0.8.7"
+      ],
+      "RepoDigests": [],
+      "Created": "2026-11-15T22:02:12.73550913-05:00",
+      "Config": {
+        "ExposedPorts": {
+          "5432/tcp": {}
+        },
+        "Env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/18/bin",
+          "GOSU_VERSION=1.19",
+          "LANG=en_US.utf8",
+          "PG_MAJOR=18",
+          "PG_VERSION=18.7-1.pgdg13+2",
+          "PGDATA=/var/lib/postgresql/18/docker"
+        ],
+        "Entrypoint": [
+          "docker-entrypoint.sh"
+        ],
+        "Cmd": [
+          "postgres"
+        ],
+        "Volumes": {
+          "/var/lib/postgresql": {}
+        },
+        "StopSignal": "SIGINT"
+      },
+      "Architecture": "amd64",
+      "Os": "linux"
+    }
+  ],
+  "measured_release": "0.2.1",
+  "server_cpu": 2,
+  "client_cpu": 0,
+  "inputs": {
+    "SIFT10M/SIFT10Mfeatures.mat": {
+      "bytes": 1059151392,
+      "sha256": "6c00da968e714c78b70dff192369f027bd29b6801f69d6047b00748706114077",
+      "mtime_ns": 1456275061000000000
+    },
+    "SIFT10M/ground_truth_indices.npy": {
+      "bytes": 800128,
+      "sha256": "a374f6d54d4721274c2d9e205a59cb2edff7f7ff1c8cc199ce416ca74241fa6a",
+      "mtime_ns": 1762965649099312886
+    },
+    "deep10m_data/base.10M.fbin": {
+      "bytes": 3840000008,
+      "sha256": "290b341abc7ba570541e013fd20fd6d38c5873490ef395b512de5ed8dee18ce7",
+      "mtime_ns": 1619869768000000000
+    },
+    "deep10m_data/query.public.10K.fbin": {
+      "bytes": 3840008,
+      "sha256": "8438fc763f14e0f9741fda15b3e11215aef089ce17d1ad47d53b52a7c9fda5bb",
+      "mtime_ns": 1761579298134394397
+    },
+    "deep10m_data/groundtruth.ibin": {
+      "bytes": 4000008,
+      "sha256": "0b830882239c383f94bd0ead75d2df63d5fe15fcca5262becdde28d620ecf242",
+      "mtime_ns": 1761579298614397632
+    }
+  },
+  "query_order_seed": 20261115,
+  "environment_captured_at_utc": "2026-11-16T05:38:10.335940+00:00",
+  "plot_packages": {
+    "matplotlib": "3.10.1",
+    "numpy": "2.2.6"
+  },
+  "runner_sha256": "cfef1ccaf5ac2e3aa6613494a2b607b00891dccf85362bf2a74a364f444810a0",
+  "cpu_governor": {
+    "scaling_governor": "performance",
+    "scaling_driver": "intel_pstate"
+  },
+  "nvme_model": "Samsung SSD 980 PRO 1TB",
+  "native_code_commit": "2e7a57fedb6dee65eeb4a4f2b7f4bed63f536400",
+  "runner_commit": "2bb5db43f8973862afa33821edd624e5865eb291",
+  "calibration_selection": "smallest ef_search meeting or exceeding the target",
+  "benchmark_completed_at_utc": "2026-11-16T06:07:53.672823+00:00"
+}

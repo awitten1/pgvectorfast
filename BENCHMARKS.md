@@ -1,39 +1,87 @@
 # Detailed Benchmark Results
 
-All benchmarks below compare **`pgvectorfast`** against **`pgvector` on stock PostgreSQL** at matching index parameters and recall. See [README.md](README.md) for the summary charts.
+The HNSW comparison uses pgvectorfast 0.2.1, upstream pgvector 0.8.7,
+Chroma 1.5.9, and Qdrant 1.20.1 on the same SIFT10M (128D) and DEEP10M (96D)
+vectors. The IVFFlat and SQL operator results below are from earlier runs.
 
-## Summary
+## HNSW setup
 
-- **In-memory HNSW (`shared_buffers = 16 GB`)**: Over 10M vectors (`k = 10`, PostgreSQL 18.0, prepared queries), `pgvectorfast` delivers **5.95x** higher throughput on `SIFT10M` (`6,227` vs `1,046` QPS at `Recall@10 = 0.93`) and **6.52x** on `DEEP10M` (`5,913` vs `907` QPS at `Recall@10 = 0.87`) compared to upstream `pgvector` on stock PostgreSQL (and **5.67x** / **6.37x** over `pgvectorfast` running on the stock PostgreSQL buffer pool without `CALL calico.activate()`).
-- **Larger-than-memory HNSW (`shared_buffers = 2 GB`)**: When the index exceeds `shared_buffers` by ~5x, `pgvectorfast` achieves **5.83x** higher throughput on `SIFT10M` (`67.8` vs `11.6` QPS) and **6.57x** on `DEEP10M` (`62.1` vs `9.5` QPS). On unmodified PostgreSQL 18 (`io_method = io_uring`, `debug_io_direct = 'data'`, `shared_buffers = 2048MB`, `ef_search = 40`, `Recall@10 = 0.9359`, 1,000 `SIFT10M` queries), `pgvectorfast` reaches **64.30 QPS** (`15.55 ms` mean, `23.00 ms` p95) versus **13.78 QPS** (`72.55 ms` mean, `113.26 ms` p95) on stock PostgreSQL (**4.67x** speedup with identical recall and query results).
-- **IVFFlat (`shared_buffers = 32 GB`)**: Lower per-page lookup overhead reduces median query latency by **27.3%** on `DBPedia OpenAI-1M` (`6.27 ms` vs `8.62 ms`, `Recall@3 = 0.91`) and **17.5%** on `GIST1M` (`15.37 ms` vs `18.63 ms`, `Recall@3 = 0.87`).
-- **Analytical scans & joins (`shared_buffers = 128 GB`)**: Across tuple widths from `128 B` to `6144 B`, lightweight buffer-pool lookups accelerate general PostgreSQL query operators as well—reaching **2.99x** on Sequential Scan, **2.34x** on Hash Join, **1.88x** on Merge Join, **1.78x** on Nested Loop Join, and **1.52x** on Indexed Nested Loop Join at `6144 B`.
+- Hardware: Intel Core i9-13900K, 62 GiB host RAM, Samsung 980 PRO NVMe.
+- Each service has one pinned server CPU, one client on a separate CPU, and
+  one outstanding query. Both PostgreSQL variants use PostgreSQL 18.7.
+- Indexes use float32 vectors, L2 distance, `M=16`, and `ef_construction=64`,
+  without quantization. The PostgreSQL variants share an identical heap/index
+  snapshot. Chroma and Qdrant build their own HNSW graphs from the same vectors.
+- Total service memory, including file cache, is limited to **16 GiB** in memory
+  and **2 GiB** for the larger-than-memory runs, with swap disabled. PostgreSQL
+  uses 14 GiB and 1536 MiB of shared buffers, respectively, plus `io_uring` and
+  direct data I/O. Files from the preceding service are evicted from its cache
+  before starting the next cgroup.
+- A fixed random permutation (NumPy seed `20261115`) splits each dataset's
+  10,000 queries: 4,000 for calibration, 6,000 disjoint queries for in-memory
+  timings, and the first 1,000 of those for larger-than-memory timings. The
+  first 2,000 calibration queries warm each engine. Every engine uses the same
+  order and split. The smallest `ef_search` reaching calibration Recall@10 of
+  at least 0.9336 for SIFT10M or 0.8712 for DEEP10M is selected. The tables
+  report actual timed-query recall.
+- Results are medians of three repeats; chart error bars show their full range.
+  Latency includes the native client API
+  call: prepared binary psycopg queries for PostgreSQL, gRPC for Qdrant, and
+  HTTP for Chroma. QPS is `1000 / mean_latency_ms`; recall checks and result
+  hashing are outside the timer. Index builds are paused during timings.
+- Larger-than-memory results require physical NVMe reads during the timed
+  queries. The raw results include cgroup memory and I/O counters and Calico
+  mapping checks.
 
----
+See the [runner and reproduction instructions](bench/hnsw/README.md) and
+[raw results](bench/hnsw/results) for calibration trials, all timing repeats,
+image identities, and environment details.
 
-## In-Memory HNSW Vector Search (`shared_buffers = 16 GB`)
+## HNSW summary
 
-Measured on PostgreSQL 18.0 using prepared queries over 10,000 timed queries (`k = 10`, `ef_search = 40`) on 10M vectors (`SIFT10M` 128D at `Recall@10 = 0.9336` and `DEEP10M` 96D at `Recall@10 = 0.8712`) where the entire HNSW index and table fit in `shared_buffers`:
+- At 16 GiB per service, pgvectorfast delivers **5.32x** the throughput of upstream pgvector on SIFT10M and **5.88x** on DEEP10M.
+- At 2 GiB per service, pgvectorfast delivers **5.70x** the throughput of upstream pgvector on SIFT10M and **5.91x** on DEEP10M.
 
-| Configuration | SIFT10M Mean / Median / P95 (ms) & QPS | SIFT10M Speedup | DEEP10M Mean / Median / P95 (ms) & QPS | DEEP10M Speedup |
-| --- | --- | --- | --- | --- |
-| Upstream `pgvector v0.8.7` (Stock PostgreSQL Buffer Pool) | 0.95 / 0.99 / 1.32 (1,046 QPS) | 1.00x | 1.10 / 1.11 / 1.43 (907 QPS) | 1.00x |
-| Calico (Array Translation) | 0.57 / 0.59 / 0.79 (1,754 QPS) | 1.68x | 0.62 / 0.63 / 0.79 (1,604 QPS) | 1.77x |
-| Calico + Optimistic Reads | 0.32 / 0.33 / 0.43 (3,132 QPS) | 2.99x | 0.32 / 0.32 / 0.40 (3,102 QPS) | 3.42x |
-| **`pgvectorfast` (Calico + Optimistic Reads + Group Prefetch, Default)** | **0.16 / 0.16 / 0.20 (6,227 QPS)** | **5.95x** | **0.17 / 0.17 / 0.20 (5,913 QPS)** | **6.52x** |
+## Search calibration
 
-Without `CALL calico.activate()` (the `pgvectorfast` extension running on stock PostgreSQL shared buffers), `SIFT10M` measures `1,098 QPS` (`0.91 ms` mean) and `DEEP10M` measures `928 QPS` (`1.07 ms` mean), corresponding to a **5.67x** and **6.37x** speedup from the Calico buffer pool and HNSW read optimizations alone.
+| Dataset | System | ef_search | Calibration Recall@10 |
+| --- | --- | ---: | ---: |
+| SIFT10M | pgvector | 40 | 0.93388 |
+| SIFT10M | pgvectorfast | 40 | 0.93388 |
+| SIFT10M | Chroma | 61 | 0.93415 |
+| SIFT10M | Qdrant | 35 | 0.93458 |
+| DEEP10M | pgvector | 39 | 0.87320 |
+| DEEP10M | pgvectorfast | 39 | 0.87315 |
+| DEEP10M | Chroma | 59 | 0.87275 |
+| DEEP10M | Qdrant | 34 | 0.87262 |
 
-## Larger-Than-Memory HNSW Vector Search (`shared_buffers = 2 GB`)
+## In-Memory HNSW (16 GiB per Service)
 
-When the HNSW index exceeds `shared_buffers` by ~5x, I/O latency dominates and batched group prefetch provides up to **6.57x** higher throughput:
+| Dataset | System | ef_search | Recall@10 | QPS | Mean (ms) | P95 (ms) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| SIFT10M | pgvector | 40 | 0.9334 | 927.0 | 1.079 | 1.460 |
+| SIFT10M | pgvectorfast | 40 | 0.9334 | 4,933.1 | 0.203 | 0.250 |
+| SIFT10M | Chroma | 61 | 0.9335 | 847.4 | 1.180 | 1.296 |
+| SIFT10M | Qdrant | 35 | 0.9335 | 1,668.5 | 0.599 | 0.675 |
+| DEEP10M | pgvector | 39 | 0.8655 | 836.1 | 1.196 | 1.550 |
+| DEEP10M | pgvectorfast | 39 | 0.8656 | 4,913.3 | 0.204 | 0.245 |
+| DEEP10M | Chroma | 59 | 0.8664 | 862.9 | 1.159 | 1.282 |
+| DEEP10M | Qdrant | 34 | 0.8673 | 1,659.1 | 0.603 | 0.668 |
 
-| Configuration | SIFT10M Mean / Median / P95 (ms) | SIFT10M Speedup | DEEP10M Mean / Median / P95 (ms) | DEEP10M Speedup |
-| --- | --- | --- | --- | --- |
-| Stock `pgvector` (PostgreSQL Hashtable Baseline) | 85.93 / 91.07 / 134.40 | 1.00x | 105.81 / 106.98 / 142.28 | 1.00x |
-| **`pgvectorfast` (Calico + Optimistic Reads + Group Prefetch, Default)** | **14.74 / 15.16 / 20.64** | **5.83x** | **16.11 / 15.73 / 21.03** | **6.57x** |
+## Larger-Than-Memory HNSW (2 GiB per Service)
 
-Running the `pgvectorfast` extension on unmodified PostgreSQL 18 (`io_method = io_uring`, `debug_io_direct = 'data'`, `shared_buffers = 2048MB`, `ef_search = 40`, `Recall@10 = 0.9359`, 1,000 `SIFT10M` queries) achieves **64.30 QPS** (`15.55 ms` mean, `23.00 ms` p95) compared to **13.78 QPS** (`72.55 ms` mean, `113.26 ms` p95) on stock PostgreSQL—a **4.67x** speedup with identical recall and query results.
+| Dataset | System | ef_search | Recall@10 | QPS | Mean (ms) | P95 (ms) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| SIFT10M | pgvector | 40 | 0.9356 | 11.4 | 87.668 | 129.250 |
+| SIFT10M | pgvectorfast | 40 | 0.9355 | 65.0 | 15.393 | 19.753 |
+| SIFT10M | Chroma | 61 | — | OOM at 2 GiB | — | — |
+| SIFT10M | Qdrant | 35 | 0.9372 | 21.2 | 47.240 | 74.524 |
+| DEEP10M | pgvector | 39 | 0.8753 | 10.4 | 96.219 | 127.511 |
+| DEEP10M | pgvectorfast | 39 | 0.8753 | 61.4 | 16.294 | 19.903 |
+| DEEP10M | Chroma | 59 | — | OOM at 2 GiB | — | — |
+| DEEP10M | Qdrant | 34 | 0.8779 | 17.9 | 55.917 | 74.860 |
+
+Chroma's process was OOM-killed while loading the 10M-vector HNSW index under the 2 GiB limit on SIFT10M and DEEP10M. Throughput and recall are unavailable for those runs.
 
 ## IVFFlat Vector Search (`shared_buffers = 32 GB`)
 

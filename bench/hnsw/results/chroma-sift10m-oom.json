@@ -1,0 +1,56 @@
+{
+  "store": "chroma",
+  "dataset": "sift10m",
+  "mode": "oom",
+  "memory_limit": "2g",
+  "swap": false,
+  "server_cpus": "2",
+  "client_cpu": 0,
+  "image": "chromadb/chroma:1.5.9",
+  "count": 10000000,
+  "ef_search": 61,
+  "calibration": {
+    "ef_search": 61,
+    "recall": 0.93415,
+    "target": 0.9336,
+    "calibration_query_range": [
+      0,
+      4000
+    ],
+    "query_order_seed": 20261115,
+    "selection": "at_least_target",
+    "trials": {
+      "40": 0.90055,
+      "80": 0.951525,
+      "10": 0.703025,
+      "45": 0.91115,
+      "62": 0.935375,
+      "53": 0.924325,
+      "57": 0.92935,
+      "59": 0.931975,
+      "60": 0.9333,
+      "61": 0.93415
+    }
+  },
+  "query_order_seed": 20261115,
+  "query_range": [
+    4000,
+    5000
+  ],
+  "outcome": "failed",
+  "error": "RemoteProtocolError('Server disconnected without sending a response.')",
+  "container_state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": true,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 137,
+    "Error": "",
+    "StartedAt": "2026-11-16T05:59:07.906333695Z",
+    "FinishedAt": "2026-11-16T05:59:11.526416379Z"
+  },
+  "server_log_tail": "\n\n                \u001b[38;5;069m(((((((((    \u001b[38;5;203m(((((\u001b[38;5;220m####\n             \u001b[38;5;069m(((((((((((((\u001b[38;5;203m(((((((((\u001b[38;5;220m#########\n           \u001b[38;5;069m(((((((((((((\u001b[38;5;203m(((((((((((\u001b[38;5;220m###########\n         \u001b[38;5;069m((((((((((((((\u001b[38;5;203m((((((((((((\u001b[38;5;220m############\n        \u001b[38;5;069m(((((((((((((\u001b[38;5;203m((((((((((((((\u001b[38;5;220m#############\n        \u001b[38;5;069m(((((((((((((\u001b[38;5;203m((((((((((((((\u001b[38;5;220m#############\n         \u001b[38;5;069m((((((((((((\u001b[38;5;203m(((((((((((((\u001b[38;5;220m##############\n         \u001b[38;5;069m((((((((((((\u001b[38;5;203m((((((((((((\u001b[38;5;220m##############\n           \u001b[38;5;069m((((((((((\u001b[38;5;203m(((((((((((\u001b[38;5;220m#############\n             \u001b[38;5;069m((((((((\u001b[38;5;203m((((((((\u001b[38;5;220m##############\n                \u001b[38;5;069m(((((\u001b[38;5;203m((((    \u001b[38;5;220m#########\u001b[0m\n\nSaving data to: /data\nConnect to Chroma at: http://localhost:8000\nGetting started guide: https://docs.trychroma.com/docs/overview/getting-started\n\n\u2601\ufe0f To deploy your DB - try Chroma Cloud!\n- Sign up: https://trychroma.com/signup\n- Copy your data to Cloud: chroma copy --to-cloud --all\n\n==========\npersist_path: \"/data\"\n\n==========\n\nNo telemetry is configured.\n"
+}

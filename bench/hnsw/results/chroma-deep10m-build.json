@@ -1,0 +1,25 @@
+{
+  "store": "chroma",
+  "dataset": "deep10m",
+  "count": 10000000,
+  "dimension": 96,
+  "m": 16,
+  "ef_construction": 64,
+  "image": "chromadb/chroma:1.5.9",
+  "build_seconds": 5219.094182564877,
+  "resumed_from": 3618000,
+  "image_digest": "[\"chromadb/chroma@sha256:1e0b73a187a28757c572acba508c46f48c9e8b0acaf5c20e6d95cdedce1acdf6\"]",
+  "collection_config": {
+    "hnsw": {
+      "space": "l2",
+      "ef_construction": 64,
+      "ef_search": 40,
+      "max_neighbors": 16,
+      "resize_factor": 1.2,
+      "sync_threshold": 100000
+    },
+    "spann": null,
+    "embedding_function": null
+  },
+  "persisted_hnsw_count": 10000000
+}

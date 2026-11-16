@@ -58,6 +58,7 @@ Stores are `pgvector`, `pgvectorfast`, `chroma`, and `qdrant`. Datasets are
 phases separately. Once a PostgreSQL fixture has been copied, reuse it with
 `calibrate` and `measure` when switching between the two PostgreSQL variants.
 Select available cores with `--build-cpus`, `--server-cpu`, and `--client-cpu`.
+In import metadata, `build_seconds` covers the last invocation, including pauses.
 
 ## Method
 

@@ -1,0 +1,79 @@
+{
+  "store": "qdrant",
+  "dataset": "deep10m",
+  "count": 10000000,
+  "dimension": 96,
+  "m": 16,
+  "ef_construction": 64,
+  "image": "qdrant/qdrant:v1.20.1",
+  "build_seconds": 1137.4472233448178,
+  "resumed_from": 374000,
+  "image_digest": "[\"qdrant/qdrant@sha256:d18c8e5061be3eaea2f53fbee1f0bf0382dc59cbb9b7112e41ffcc937ec14220\"]",
+  "collection_config": {
+    "status": "green",
+    "optimizer_status": "ok",
+    "warnings": null,
+    "indexed_vectors_count": 10000000,
+    "points_count": 10000000,
+    "segments_count": 2,
+    "config": {
+      "params": {
+        "vectors": {
+          "size": 96,
+          "distance": "Euclid",
+          "hnsw_config": null,
+          "quantization_config": null,
+          "on_disk": null,
+          "memory": "cached",
+          "datatype": null,
+          "multivector_config": null
+        },
+        "shard_number": 1,
+        "sharding_method": null,
+        "replication_factor": 1,
+        "write_consistency_factor": 1,
+        "read_fan_out_factor": null,
+        "read_fan_out_delay_ms": null,
+        "on_disk_payload": true,
+        "payload": null,
+        "id_tracker": null,
+        "sparse_vectors": null
+      },
+      "hnsw_config": {
+        "m": 16,
+        "ef_construct": 64,
+        "full_scan_threshold": 10000,
+        "max_indexing_threads": 6,
+        "on_disk": false,
+        "memory": "cached",
+        "payload_m": null,
+        "inline_storage": null
+      },
+      "optimizer_config": {
+        "deleted_threshold": 0.2,
+        "vacuum_min_vector_number": 1000,
+        "default_segment_number": 1,
+        "max_segment_size": 50000000,
+        "memmap_threshold": null,
+        "indexing_threshold": 10000,
+        "flush_interval_sec": 5,
+        "max_optimization_threads": 1,
+        "prevent_unoptimized": null
+      },
+      "wal_config": {
+        "wal_capacity_mb": 32,
+        "wal_segments_ahead": 0,
+        "wal_retain_closed": 1
+      },
+      "quantization_config": null,
+      "strict_mode_config": null,
+      "metadata": null
+    },
+    "payload_schema": {},
+    "update_queue": {
+      "length": 0,
+      "deferred_points": null
+    },
+    "created_at": "2026-11-16T03:08:52.241000Z"
+  }
+}
