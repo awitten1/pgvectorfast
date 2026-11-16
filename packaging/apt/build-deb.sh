@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PG_MAJOR="${PG_MAJOR:-18}"
-PGVECTORFAST_VERSION="${PGVECTORFAST_VERSION:-0.2.0}"
+PGVECTORFAST_VERSION="${PGVECTORFAST_VERSION:-0.2.1}"
 PG_CONFIG="${PG_CONFIG:-/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config}"
 OUTDIR="${OUTDIR:-$(pwd)/dist}"
 

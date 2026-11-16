@@ -14,6 +14,7 @@ on:
       - 'src/**'
       - 'sql/**'
       - 'examples/**'
+      - 'test/packaging.*'
       - '.github/workflows/apt.yml'
   schedule:
     - cron: '0 6 * * *'
@@ -52,7 +53,7 @@ jobs:
             ver="${GITHUB_REF_NAME#v}"
           else
             meta_ver=$(sed -nE 's/^[[:blank:]]*"version"[[:blank:]]*:[[:blank:]]*"([^"]+)".*/\1/p' META.json | head -n 1)
-            base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || echo "${meta_ver:-0.2.0}")
+            base=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || echo "${meta_ver:-0.2.1}")
             rev=$(git rev-list --count "v${base}..HEAD" 2>/dev/null || echo '0')
             if [ "$rev" -gt 0 ]; then
               ver="${base}.${rev}"
@@ -88,6 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --shm-size=512m \
+            -v "$PWD:/src:ro" \
             -v "$PWD/dist/${{ matrix.codename }}:/debs:ro" \
             -e PG_MAJOR="${{ matrix.pg_major }}" \
             -e CODENAME="${{ matrix.codename }}" \
@@ -109,11 +111,14 @@ jobs:
                 pg_ctl -D \"\$PGDATA\" -l /tmp/pg.log -w start
                 psql -h /tmp -d postgres -v ON_ERROR_STOP=1 -f \"/usr/share/doc/postgresql-${PG_MAJOR}-pgvectorfast/examples/getting-started.sql\"
                 psql -h /tmp -d postgres -v ON_ERROR_STOP=1 \
-                  -c \"CREATE EXTENSION vector;\" \
-                  -c \"CREATE EXTENSION calico;\" \
-                  -c \"CALL calico.activate();\"
+                  -c \"CREATE EXTENSION vectorfast;\"
                 status=\$(psql -h /tmp -d postgres -tAc \"SELECT calico.status();\")
                 [ \"\$status\" = \"calico\" ]
+              "
+              PGHOST=/tmp bash /src/test/packaging.sh
+              su - postgres -c "
+                export PATH=/usr/lib/postgresql/${PG_MAJOR}/bin:\$PATH
+                PGDATA=/tmp/pgdata
                 pg_ctl -D \"\$PGDATA\" -m fast -w stop
               "
             '

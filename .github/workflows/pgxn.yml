@@ -116,11 +116,9 @@ jobs:
           trap 'pg_ctl -D "${PGDATA}" -m fast -w stop || true' EXIT
 
           pgxn check --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}"
-          pgxn load --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}"
+          pgxn load --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}" vectorfast
 
           psql -h /tmp -d postgres -v ON_ERROR_STOP=1 <<'SQL_EOF'
-          CREATE EXTENSION IF NOT EXISTS vector;
-          CALL calico.activate();
           DO $$
           BEGIN
             IF calico.status() <> 'calico' THEN
@@ -133,14 +131,15 @@ jobs:
           SELECT id FROM pgxn_smoke ORDER BY embedding <-> '[1,0,0]' LIMIT 1;
           SQL_EOF
 
-          pgxn unload --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}"
-          psql -h /tmp -d postgres -v ON_ERROR_STOP=1 -c "DROP TABLE pgxn_smoke; DROP EXTENSION vector;"
+          pgxn unload --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}" vectorfast
+          psql -h /tmp -d postgres -v ON_ERROR_STOP=1 -c "DROP TABLE pgxn_smoke; DROP EXTENSION vector; DROP EXTENSION calico;"
           PG_EOF
 
           pgxn uninstall --pg_config "${PG_CONFIG}" --yes "${PGXN_ZIP}"
           test ! -e "$("${PG_CONFIG}" --pkglibdir)/vectorfast.so"
           test ! -e "$("${PG_CONFIG}" --sharedir)/extension/calico.control"
           test ! -e "$("${PG_CONFIG}" --sharedir)/extension/vector.control"
+          test ! -e "$("${PG_CONFIG}" --sharedir)/extension/vectorfast.control"
           EOF
           chmod +x "${test_script}"
           docker run --rm --shm-size=512m \

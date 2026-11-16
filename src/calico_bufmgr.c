@@ -230,6 +230,13 @@ CalicoLookupAndPin(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
         }
         UnpinBuffer(buf);
     }
+    /* GetPrivateRefCountEntry(..., true) may consume the reserved entry when
+     * moving an already pinned buffer out of the overflow hash. If that
+     * buffer is not yet BM_VALID, TryPin returns false without unpinning the
+     * caller's existing reference. Replenish the reservation before the slow
+     * path's PinBuffer, outside its mapping locks where allocation is safe.
+     * This also covers a stale-tag retry after a speculative successful pin. */
+    ReservePrivateRefCountEntry();
     return calico_lookup_and_pin_slow(&tag, entry_ptr, relpersistence,
                                       strategy, foundPtr, io_context);
 }

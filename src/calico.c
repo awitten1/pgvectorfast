@@ -10,11 +10,115 @@
 #include "common/config_info.h"
 #include "nodes/parsenodes.h"
 #include "tcop/pquery.h"
+#include "tcop/utility.h"
+#include "access/xact.h"
+#include "nodes/makefuncs.h"
 
 static shmem_startup_hook_type previous_startup;
 static shmem_request_hook_type previous_request;
 static bool prepared;
+static ProcessUtility_hook_type previous_utility;
+static bool installing_vectorfast;
 bool calico_enable_optimistic_reads = true;
+
+/*
+ * vectorfast is an umbrella extension; vector retains ownership of its types
+ * and indexes, preserving pgvector upgrades, dumps and client compatibility.
+ * Supply CASCADE only for this entry point, using PostgreSQL's dependency
+ * installer rather than attempting an unsupported nested CREATE EXTENSION.
+ *
+ * The buffer-pool handoff is server-wide and cannot be rolled back. Like the
+ * explicit activation procedure, require a standalone, top-level command.
+ * PreventInTransactionBlock rejects explicit/implicit transaction blocks and
+ * forces immediate commit for a successful standalone command.
+ * Install first, then synchronously use the existing qualified handoff: an
+ * installation error never activates the pool, and activation failure rolls
+ * back the SQL installation. No transaction or executor hooks enter hot paths.
+ */
+static void
+vectorfast_utility(PlannedStmt *pstmt, const char *queryString,
+                  bool readOnlyTree, ProcessUtilityContext context,
+                  ParamListInfo params, QueryEnvironment *queryEnv,
+                  DestReceiver *dest, QueryCompletion *qc)
+{
+    bool enable = IsA(pstmt->utilityStmt, CreateExtensionStmt) &&
+        strcmp(((CreateExtensionStmt *) pstmt->utilityStmt)->extname,
+               "vectorfast") == 0;
+
+    /* Leave ordinary utilities (including PREPARE/EXECUTE) on a direct
+     * chaining path, without installing an exception frame per command. */
+    if (!enable)
+    {
+        if (previous_utility)
+            previous_utility(pstmt, queryString, readOnlyTree, context,
+                             params, queryEnv, dest, qc);
+        else
+            standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+                                    params, queryEnv, dest, qc);
+        return;
+    }
+
+    if (enable)
+    {
+        CreateExtensionStmt *stmt;
+        ListCell *lc;
+        bool cascade = false;
+
+        if (!superuser())
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                            errmsg("pgvectorfast activation requires superuser")));
+        PreventInTransactionBlock(context == PROCESS_UTILITY_TOPLEVEL,
+                                  "CREATE EXTENSION vectorfast");
+        /* Cached utility trees can be reused; never modify the caller's tree. */
+        pstmt = copyObject(pstmt);
+        stmt = (CreateExtensionStmt *) pstmt->utilityStmt;
+        foreach(lc, stmt->options)
+            if (strcmp(((DefElem *) lfirst(lc))->defname, "cascade") == 0)
+                cascade = true;
+        if (!cascade)
+            stmt->options = lappend(stmt->options,
+                makeDefElem("cascade", (Node *) makeBoolean(true), -1));
+        readOnlyTree = false;
+        installing_vectorfast = true;
+    }
+
+    PG_TRY();
+    {
+        if (previous_utility)
+            previous_utility(pstmt, queryString, readOnlyTree, context,
+                             params, queryEnv, dest, qc);
+        else
+            standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+                                    params, queryEnv, dest, qc);
+    }
+    PG_FINALLY();
+    {
+        if (enable)
+            installing_vectorfast = false;
+    }
+    PG_END_TRY();
+
+    if (enable)
+    {
+        calico_native_qualify();
+        calico_activate_cluster(30000);
+    }
+}
+
+/* The installation script must fail atomically if the library was not
+ * preloaded (and hence the dependency/activation hook was never installed).
+ * Its temporary SQL function is removed before installation completes. */
+PG_FUNCTION_INFO_V1(calico_vectorfast_install_check);
+Datum
+calico_vectorfast_install_check(PG_FUNCTION_ARGS)
+{
+    if (!prepared || !installing_vectorfast)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pgvectorfast requires shared_preload_libraries = 'vectorfast'"),
+                 errhint("Preload the library, restart PostgreSQL, and run CREATE EXTENSION vectorfast again.")));
+    PG_RETURN_VOID();
+}
 
 static void
 calico_startup(void)
@@ -63,6 +167,8 @@ CalicoInit(void)
         shmem_request_hook = calico_request;
         previous_startup = shmem_startup_hook;
         shmem_startup_hook = calico_startup;
+        previous_utility = ProcessUtility_hook;
+        ProcessUtility_hook = vectorfast_utility;
     }
 }
 

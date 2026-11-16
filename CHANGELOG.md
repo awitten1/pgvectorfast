@@ -1,3 +1,10 @@
+## pgvectorfast 0.2.1
+
+- Enable pgvector and Calico with `CREATE EXTENSION vectorfast;`.
+- Preserve the separate extension creation and activation commands.
+- Fix private buffer-pin reservation on a Calico fallback during VACUUM.
+- Test both setup paths and pgvector regressions in packaged installations.
+
 ## 0.8.7 (2026-10-01)
 
 - Fixed buffer overflow with IVFFlat index build - [more info](https://github.com/pgvector/pgvector/issues/1036)

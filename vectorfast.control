@@ -1,0 +1,6 @@
+comment = 'pgvector with the Calico shared buffer pool'
+default_version = '0.2.1'
+module_pathname = '$libdir/vectorfast'
+requires = 'vector, calico'
+relocatable = true
+superuser = true

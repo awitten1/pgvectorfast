@@ -73,7 +73,7 @@ sudo apt-get update
 sudo apt-get install -y postgresql-18-pgvectorfast
 ```
 
-3. Continue with [Quick Start](#quick-start) to preload `vectorfast` in `postgresql.conf` and activate Calico.
+3. Continue with [Quick Start](#quick-start) to preload `vectorfast` and enable the extension.
 
 ### PGXN
 
@@ -126,16 +126,23 @@ make PG_CONFIG=/path/to/pg_config install
 shared_preload_libraries = 'vectorfast'
 ```
 
-2. Create the extensions and activate the Calico buffer pool (as superuser, outside a transaction block):
+2. Enable pgvector and the Calico buffer pool using either approach (as superuser, outside a transaction block):
+
+With one command:
 
 ```sql
-CREATE EXTENSION vector;   -- pgvector types, operators, and indexes
-CREATE EXTENSION calico;   -- Calico shared buffer pool management
-
-SELECT calico.status();    -- 'stock' before activation
-CALL calico.activate();    -- switches PostgreSQL's shared buffer pool to Calico
-SELECT * FROM calico.pool; -- inspect pool status, mappings, and statistics
+CREATE EXTENSION vectorfast;
 ```
+
+Or create the extensions and activate Calico explicitly:
+
+```sql
+CREATE EXTENSION vector;
+CREATE EXTENSION calico;
+CALL calico.activate();
+```
+
+After subsequent PostgreSQL restarts, run `CALL calico.activate();` to reactivate the buffer pool.
 
 3. Create an HNSW index and run similarity queries using standard pgvector SQL:
 
@@ -144,8 +151,6 @@ CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(128));
 CREATE INDEX ON items USING hnsw (embedding vector_l2_ops);
 SELECT * FROM items ORDER BY embedding <-> '[...]' LIMIT 10;
 ```
-
-Activation switches PostgreSQL's entire shared buffer pool across all databases (covering both `pgvector` indexes and ordinary heap/B-tree relations) and remains active until the server restarts. Without `shared_preload_libraries`, `CREATE EXTENSION vector` continues to work using PostgreSQL's standard buffer manager.
 
 See the runnable [getting-started example](examples/getting-started.sql) and the full [pgvector Documentation](PGVECTOR.md) for all vector types, distance operators, iterative scans, and indexing options.
 

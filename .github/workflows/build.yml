@@ -64,6 +64,15 @@ jobs:
           trap 'pg_ctl -D "$PGDATA" -m fast -w stop || true' EXIT
           psql -h /tmp -d postgres -v ON_ERROR_STOP=1 -f examples/getting-started.sql
           PGHOST=/tmp make PG_CONFIG="$PG_CONFIG" installcheck
+      - name: Test single-command setup and activation lifecycle
+        run: |
+          export PATH="$PG_PREFIX/bin:$PATH"
+          export PERL5LIB="$PG_SRC/src/test/perl"
+          export PG_REGRESS="$PG_BUILD/src/test/regress/pg_regress"
+          export TESTDATADIR="$RUNNER_TEMP/vectorfast-install-test"
+          export TESTLOGDIR="$RUNNER_TEMP/vectorfast-install-log"
+          mkdir -p "$TESTDATADIR" "$TESTLOGDIR"
+          prove -v test/t/049_vectorfast_install.pl
       - name: Print diagnostics on failure
         if: failure()
         run: |
