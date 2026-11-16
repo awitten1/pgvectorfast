@@ -2,7 +2,8 @@
 """Recall-calibrated, single-client HNSW comparison on the existing 10M datasets.
 
 Builds may use several cores; queries use one fixed server core and one client
-core. Docker limits include anonymous memory AND file cache, with swap disabled.
+core. Docker limits include anonymous memory AND file cache. Swap is disabled
+except in the explicit paging mode, which requires host swap to be available.
 Store data must live on a real NVMe filesystem, not a loop device. This script
 never changes system-wide caches, swap settings, or another application's data.
 """
@@ -83,6 +84,7 @@ class Store:
         self.client = None
         self.col = None
         self.ef = None
+        self.swap_bytes = 0
         offset = 10 if args.dataset == 'deep10m' else 0
         self.http_port = 8800 + offset if args.store == 'chroma' else 8643 + offset
         self.grpc_port = 8644 + offset
@@ -113,6 +115,12 @@ class Store:
         self.client = None
         self.col = None
 
+    def memory_swap_limit(self, memory, build=False):
+        if build or not self.swap_bytes:
+            return memory
+        assert memory.endswith('g')
+        return str(int(memory[:-1]) * 1024**3 + self.swap_bytes)
+
     def start(self, memory='16g', build=False):
         self.stop()
         self.current_memory = memory
@@ -131,7 +139,8 @@ class Store:
                         os.close(fd)
         cmd = ['docker', 'run', '-d', '--name', self.name,
                '--label', 'pgvf.benchmark=crossstore', '--memory', memory,
-               '--memory-swap', memory, '--cpuset-cpus', self.a.build_cpus if build else str(self.a.server_cpu),
+               '--memory-swap', self.memory_swap_limit(memory, build),
+               '--cpuset-cpus', self.a.build_cpus if build else str(self.a.server_cpu),
                '--log-opt', 'max-size=10m', '--log-opt', 'max-file=2']
         if self.a.store == 'chroma':
             cmd += ['-p', f'127.0.0.1:{self.http_port}:8000', '-v', f'{self.data}:/data',
@@ -371,7 +380,8 @@ class Store:
         root = Path('/sys/fs/cgroup') / cg.lstrip('/')
         out = {}
         for name in ('memory.current', 'memory.peak', 'memory.max', 'memory.swap.max',
-                     'memory.stat', 'memory.events', 'io.stat', 'cpu.stat'):
+                     'memory.swap.current', 'memory.swap.peak', 'memory.swap.events',
+                     'memory.stat', 'memory.events', 'memory.pressure', 'io.stat', 'cpu.stat'):
             p = root / name
             if p.exists():
                 out[name] = p.read_text()
@@ -388,10 +398,13 @@ class Store:
 
     def measure(self, mode, queries, gt):
         memory = '16g' if mode == 'inmem' else '2g'
+        self.swap_bytes = self.a.swap_gib * 1024**3 if mode == 'paging' else 0
         tuned = json.loads((self.a.output / f'{self.a.store}-{self.a.dataset}-tuned.json').read_text())
         assert tuned['query_order_seed'] == QUERY_SEED
         result = {'store': self.a.store, 'dataset': self.a.dataset, 'mode': mode,
-            'memory_limit': memory, 'swap': False, 'server_cpus': str(self.a.server_cpu), 'client_cpu': self.a.client_cpu,
+            'memory_limit': memory, 'swap': bool(self.swap_bytes),
+            'swap_allowance_bytes': self.swap_bytes,
+            'server_cpus': str(self.a.server_cpu), 'client_cpu': self.a.client_cpu,
             'image': IMAGES[self.a.store], 'count': self.a.count, 'ef_search': tuned['ef_search'],
             'calibration': tuned, 'query_order_seed': QUERY_SEED,
             'query_range': [CALIBRATION_QUERIES, 10000 if mode == 'inmem' else CALIBRATION_QUERIES+1000]}
@@ -399,8 +412,18 @@ class Store:
             self.start(memory)
             self.attach()
             self.set_ef(tuned['ef_search'])
-            for q in queries[:2000]:
+            host_config = self.state()['HostConfig']
+            result['resource_limits'] = {key: host_config[key]
+                for key in ('Memory', 'MemorySwap', 'CpusetCpus')}
+            result['memory_at_start'] = self.memory_stats()
+            if mode == 'paging':
+                assert int(result['memory_at_start']['memory.max']) == 2 * 1024**3
+                assert int(result['memory_at_start']['memory.swap.max']) == self.swap_bytes
+            print(f'warming {self.a.store} {self.a.dataset} {mode}: 0/2000', flush=True)
+            for i, q in enumerate(queries[:2000]):
                 self.query(q)
+                if (i + 1) % 100 == 0:
+                    print(f'warmup {i + 1}/2000', flush=True)
             before = self.memory_stats()
             repeats = []
             start, end = result['query_range']
@@ -424,8 +447,10 @@ class Store:
                     memory_before=before, memory_after=self.memory_stats())
                 result['timed_read_bytes'] = self.read_bytes(result['memory_after']) - self.read_bytes(before)
                 save(self.a.output / f'{self.a.store}-{self.a.dataset}-{mode}.json', result)
-            if mode == 'oom' and result['timed_read_bytes'] < 64 * 1024**2:
+            if mode in ('oom', 'paging') and result['timed_read_bytes'] < 64 * 1024**2:
                 raise RuntimeError('less than 64 MiB read during larger-than-memory timing; invalid OOM run')
+            if mode == 'paging' and int(result['memory_after']['memory.swap.current']) == 0:
+                raise RuntimeError('paging run did not use swap')
         except Exception as exc:
             state = self.state()
             log = shell('docker', 'logs', '--tail', '60', self.name, check=False)
@@ -474,7 +499,8 @@ class Postgres(Store):
         active = self.a.store == 'pgvectorfast'
         cmd = ['docker', 'run', '-d', '--name', self.name,
             '--label', 'pgvf.benchmark=crossstore', '--memory', memory,
-            '--memory-swap', memory, '--cpuset-cpus', str(self.a.server_cpu), '--shm-size', '20g',
+            '--memory-swap', self.memory_swap_limit(memory),
+            '--cpuset-cpus', str(self.a.server_cpu), '--shm-size', '20g',
             '--security-opt', 'seccomp=unconfined',
             '--user', f'{os.getuid()}:{os.getgid()}',
             '-p', '127.0.0.1:8842:5432', '-v', f'{self.data}:/benchdata',
@@ -553,7 +579,9 @@ def main():
     p.add_argument('--work-dir', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--action', choices=['build', 'calibrate', 'measure', 'all'], default='all')
-    p.add_argument('--mode', choices=['inmem', 'oom', 'both'], default='both')
+    p.add_argument('--mode', choices=['inmem', 'oom', 'paging', 'both'], default='both')
+    p.add_argument('--swap-gib', type=int, default=16,
+                   help='Additional swap allowance in paging mode (default: 16 GiB)')
     p.add_argument('--count', type=int, default=10_000_000)
     p.add_argument('--batch-size', type=int, default=2000)
     p.add_argument('--repeats', type=int, default=3)
@@ -562,6 +590,8 @@ def main():
     p.add_argument('--client-cpu', type=int, default=0)
     p.add_argument('--pg-user', default=getpass.getuser())
     a = p.parse_args()
+    if a.mode == 'paging' and a.swap_gib <= 0:
+        p.error('--swap-gib must be positive in paging mode')
     a.work_dir.mkdir(parents=True, exist_ok=True)
     a.output.mkdir(parents=True, exist_ok=True)
     source = shell('findmnt', '-n', '-o', 'SOURCE', '-T', a.work_dir).stdout.strip()

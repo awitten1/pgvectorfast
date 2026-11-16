@@ -107,7 +107,7 @@ def main():
     plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 12,
                          'axes.spines.top': False, 'axes.spines.right': False})
     for mode, title, budget in [('inmem', 'In-Memory HNSW', '16 GiB per service'),
-                                ('oom', 'Larger-Than-Memory HNSW', '2 GiB per service')]:
+                                ('oom', 'Larger-Than-Memory HNSW', '2 GiB per service, OS swap disabled')]:
         fig, ax = plt.subplots(figsize=(10, 6))
         xpos = np.arange(2)
         width = .19

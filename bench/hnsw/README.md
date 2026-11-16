@@ -60,6 +60,22 @@ phases separately. Once a PostgreSQL fixture has been copied, reuse it with
 Select available cores with `--build-cpus`, `--server-cpu`, and `--client-cpu`.
 In import metadata, `build_seconds` covers the last invocation, including pauses.
 
+For an OS-paging run, provision swap on the host and select `paging`:
+
+```sh
+/tmp/hnsw-venv/bin/python bench/hnsw/crossstore.py \
+  --store chroma --dataset sift10m --data-root /path/to/datasets \
+  --work-dir /nvme/hnsw --output /path/to/paging-results \
+  --action measure --mode paging --swap-gib 16
+```
+
+This caps resident memory, including file cache, at 2 GiB and allows an additional
+16 GiB of swap. Docker's [combined memory-and-swap limit](https://docs.docker.com/engine/containers/resource_constraints/#--memory-swap-details)
+is therefore 18 GiB.
+The runner records the actual cgroup limits, swap usage, memory pressure, and I/O
+counters. Host swap is provisioned separately; the runner does not enable swap or
+change the host's swappiness. Paging results use a separate `*-paging.json` file.
+
 ## Method
 
 - Index configuration: float32 L2, HNSW `M=16`, `ef_construction=64`, no quantization.
@@ -76,8 +92,9 @@ In import metadata, `build_seconds` covers the last invocation, including pauses
   Qdrant uses gRPC, and Chroma uses HTTP. Latencies include client API calls;
   recall calculation and result hashing are outside the timer. QPS is
   `1000 / mean_latency_ms` for those sequential API calls.
-- Service-wide memory limits are 16 GiB and 2 GiB, including file cache, with
-  swap disabled. PostgreSQL uses 14 GiB and 1536 MiB of shared buffers,
+- The default `inmem` and `oom` modes have service-wide memory limits of 16 GiB
+  and 2 GiB, including file cache, with swap disabled. The explicit `paging` mode
+  permits the configured swap allowance. PostgreSQL uses 14 GiB and 1536 MiB of shared buffers,
   respectively, and `io_uring` with direct data I/O.
 - Before each service starts, its stopped data files are advised out of the
   file cache so cache charged to an earlier cgroup cannot bypass the new cap.

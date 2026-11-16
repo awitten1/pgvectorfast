@@ -81,7 +81,33 @@ image identities, and environment details.
 | DEEP10M | Chroma | 59 | — | OOM at 2 GiB | — | — |
 | DEEP10M | Qdrant | 34 | 0.8779 | 17.9 | 55.917 | 74.860 |
 
-Chroma's process was OOM-killed while loading the 10M-vector HNSW index under the 2 GiB limit on SIFT10M and DEEP10M. Throughput and recall are unavailable for those runs.
+With OS swap disabled, Chroma's process was OOM-killed while loading the 10M-vector HNSW index under the 2 GiB limit on SIFT10M and DEEP10M. Throughput and recall are unavailable for those runs.
+
+## Chroma with OS Paging
+
+Chroma 1.5.9 was rerun on the same persisted 10M-vector indexes with a **2 GiB
+RAM limit and 16 GiB of NVMe-backed swap**. The indexes loaded under the 2 GiB
+limit. Search settings remained `ef_search=61` for SIFT10M and `59` for DEEP10M.
+Each paging run used the same 2,000 warm-up queries and 1,000 held-out timing
+queries as the original larger-than-memory runs, with three repeats. The 16 GiB
+in-memory references were also repeated with 6,000 timing queries per repeat.
+
+| Dataset | RAM cap | Swap allowance | ef_search | Recall@10 | QPS | Mean / P95 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SIFT10M | 16 GiB | 0 GiB | 61 | 0.9335 | 855.1 | 1.169 / 1.288 |
+| SIFT10M | 2 GiB | 16 GiB | 61 | 0.9339 | 14.2 | 70.431 / 108.953 |
+| DEEP10M | 16 GiB | 0 GiB | 59 | 0.8664 | 856.7 | 1.167 / 1.283 |
+| DEEP10M | 2 GiB | 16 GiB | 59 | 0.8749 | 13.6 | 73.312 / 95.622 |
+
+These runs permit OS swap; the four-system comparison above disables it. The
+paging cases ended with 7.22 GiB of swap in use for SIFT10M and 6.00 GiB for
+DEEP10M. Timed queries performed 10.15 GiB and 10.45 GiB of physical reads,
+respectively, and both runs completed without OOM events. The temporary swap
+area was removed afterward, with the original swap configuration preserved.
+
+[Raw paging results and environment](bench/hnsw/results/chroma-paging) include
+actual cgroup limits, swap usage, page-fault counts, I/O counters, and all three
+repeats. See the [paging command](bench/hnsw/README.md#run) to reproduce the run.
 
 ## IVFFlat Vector Search (`shared_buffers = 32 GB`)
 
