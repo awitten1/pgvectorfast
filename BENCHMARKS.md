@@ -2,13 +2,11 @@
 
 The HNSW comparison uses pgvectorfast 0.2.1, upstream pgvector 0.8.7,
 Chroma 1.5.9, and Qdrant 1.20.1 on the same SIFT10M (128D) and DEEP10M (96D)
-vectors. The IVFFlat and SQL operator results below are from earlier runs.
+vectors.
 
 The README figures use the latest Chroma rerun: 855.1 / 856.7 QPS at 16 GiB RAM
 and 14.2 / 13.6 QPS at 2 GiB RAM with 16 GiB of NVMe swap (SIFT10M / DEEP10M).
-The other systems' plotted measurements used no swap. The original no-swap
-tables are retained below, followed by the Chroma rerun's full results.
-
+The other systems' plotted measurements used no swap. 
 ## HNSW setup
 
 - Hardware: Intel Core i9-13900K, 62 GiB host RAM, Samsung 980 PRO NVMe.
@@ -92,7 +90,7 @@ With OS swap disabled, Chroma's process was OOM-killed while loading the 10M-vec
 
 Chroma 1.5.9 was rerun on the same persisted 10M-vector indexes with a **2 GiB
 RAM limit and 16 GiB of NVMe-backed swap**. The indexes loaded under the 2 GiB
-limit. Search settings remained `ef_search=61` for SIFT10M and `59` for DEEP10M.
+limit. Search settings: `ef_search=61` for SIFT10M and `59` for DEEP10M.
 Each paging run used the same 2,000 warm-up queries and 1,000 held-out timing
 queries as the original larger-than-memory runs, with three repeats. The 16 GiB
 in-memory references were also repeated with 6,000 timing queries per repeat.

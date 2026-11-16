@@ -26,8 +26,6 @@ Based on [pgvector](https://github.com/pgvector/pgvector/), pgvectorfast is a st
 
 See [Detailed Benchmark Results](BENCHMARKS.md) for measured recall, latency breakdowns, and experimental configurations.
 
-The HNSW figures include the latest [Chroma rerun](BENCHMARKS.md#chroma-with-os-paging), including its successful 2 GiB RAM run with 16 GiB of NVMe swap. The other systems' plotted runs had swap disabled.
-
 ## How It Works
 
 PostgreSQL's default buffer manager translates every page reference through a partitioned shared hash table and acquires atomic pins and buffer content locks on every page read. Across vector index lookups and analytical scans/joins—and especially during HNSW graph traversal, which performs thousands of irregular neighbor lookups per query—page translation, pin/unpin atomic traffic, and synchronous random I/O become major bottlenecks.
