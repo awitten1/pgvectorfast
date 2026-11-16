@@ -10,6 +10,11 @@ export TEST_SOURCE="${TEST_SOURCE:-/src}"
 export TEST_WORK
 TEST_WORK=$(mktemp -d /tmp/pgvectorfast-package-test.XXXXXX)
 
+# Docker and APT must ship the same extension upgrade paths as source/PGXN.
+for script in "$TEST_SOURCE"/sql/*--*--*.sql; do
+    cmp "$script" "$("$PG_CONFIG" --sharedir)/extension/$(basename "$script")"
+done
+
 # Test tooling is installed in this disposable container; make installcheck
 # exercises the shipped library and SQL files without rebuilding or installing.
 apt-get update -qq

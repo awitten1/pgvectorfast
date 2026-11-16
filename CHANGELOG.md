@@ -4,6 +4,7 @@
 - Preserve the separate extension creation and activation commands.
 - Fix private buffer-pin reservation on a Calico fallback during VACUUM.
 - Test both setup paths and pgvector regressions in packaged installations.
+- Include pgvector SQL upgrade scripts in Docker images.
 
 ## 0.8.7 (2026-10-01)
 

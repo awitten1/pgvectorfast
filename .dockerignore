@@ -10,6 +10,8 @@ Dockerfile
 *.so
 *.a
 sql/vector--*.sql
+!sql/vector--*--*.sql
+.deps/
 regression.diffs
 regression.out
 results/
