@@ -1,0 +1,112 @@
+{
+  "description": "Historical IVFFlat and analytical values preserved from the existing README figures; this file records the plotted data, not new benchmark runs.",
+  "ivfflat": {
+    "shared_buffers_gb": 32,
+    "datasets": [
+      {
+        "name": "DBPedia OpenAI-1M",
+        "dimensions": 1536,
+        "recall_at_3": 0.91,
+        "pgvector_median_ms": 8.62,
+        "pgvectorfast_median_ms": 6.27
+      },
+      {
+        "name": "GIST1M",
+        "dimensions": 960,
+        "recall_at_3": 0.87,
+        "pgvector_median_ms": 18.63,
+        "pgvectorfast_median_ms": 15.37
+      }
+    ]
+  },
+  "analytical": {
+    "shared_buffers_gb": 128,
+    "row_sizes_bytes": [
+      128,
+      256,
+      512,
+      1024,
+      1524,
+      2048,
+      4096,
+      6144
+    ],
+    "series": [
+      {
+        "label": "Sequential Scan",
+        "source": "seqscan_results/seqscan_comparison_summary.csv",
+        "join_mode": null,
+        "speedups": [
+          1.168,
+          1.276,
+          1.336,
+          1.478,
+          1.633,
+          1.843,
+          2.652,
+          2.988
+        ]
+      },
+      {
+        "label": "Hash Join",
+        "source": "hashjoin_results/hashjoin_comparison_summary.csv",
+        "join_mode": null,
+        "speedups": [
+          1.027,
+          1.033,
+          1.11,
+          1.162,
+          1.243,
+          1.351,
+          2.139,
+          2.341
+        ]
+      },
+      {
+        "label": "Merge Join",
+        "source": "mergejoin_results/mergejoin_comparison_summary.csv",
+        "join_mode": null,
+        "speedups": [
+          1.055,
+          1.128,
+          1.163,
+          1.224,
+          1.263,
+          1.364,
+          1.683,
+          1.883
+        ]
+      },
+      {
+        "label": "Nested Loop Join",
+        "source": "nestedloop_results/nestedloop_comparison_summary.csv",
+        "join_mode": "noindex",
+        "speedups": [
+          1.057,
+          1.113,
+          1.181,
+          1.318,
+          1.48,
+          1.445,
+          1.755,
+          1.779
+        ]
+      },
+      {
+        "label": "Indexed Nested Loop",
+        "source": "nestedloop_results/nestedloop_comparison_summary.csv",
+        "join_mode": "indexed",
+        "speedups": [
+          1.051,
+          1.062,
+          1.095,
+          1.134,
+          1.134,
+          1.185,
+          1.437,
+          1.52
+        ]
+      }
+    ]
+  }
+}

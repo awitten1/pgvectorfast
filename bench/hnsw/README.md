@@ -119,3 +119,11 @@ across engines for the same dataset and memory budget.
 ```
 
 This exports the two HNSW charts, a CSV summary, and Markdown result tables.
+
+All four README figures share the fonts, colors, and layout helpers in
+`bench/plot_style.py`. Regenerate the IVFFlat and analytical-query figures from
+their recorded historical values in `bench/figure_data.json` with:
+
+```sh
+/tmp/hnsw-venv/bin/python bench/plot_other_figures.py --assets assets
+```

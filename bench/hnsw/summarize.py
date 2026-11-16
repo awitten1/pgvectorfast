@@ -5,16 +5,19 @@ import csv
 import json
 from pathlib import Path
 import statistics
+import sys
 
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from plot_style import PALETTE, apply_style, new_chart, add_legend, save_chart
 
 STORES = ['pgvector', 'pgvectorfast', 'chroma', 'qdrant']
 NAMES = {'pgvector': 'pgvector', 'pgvectorfast': 'pgvectorfast',
          'chroma': 'Chroma', 'qdrant': 'Qdrant'}
-COLORS = ['#4c78a8', '#f58518', '#b279a2', '#54a24b']
+COLORS = PALETTE[:4]
 DATASETS = ['sift10m', 'deep10m']
 
 
@@ -104,11 +107,10 @@ def main():
         lines += ['']
     (a.results / 'tables.md').write_text('\n'.join(lines))
     a.assets.mkdir(parents=True, exist_ok=True)
-    plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 12,
-                         'axes.spines.top': False, 'axes.spines.right': False})
+    apply_style()
     for mode, title, budget in [('inmem', 'In-Memory HNSW', '16 GiB per service'),
                                 ('oom', 'Larger-Than-Memory HNSW', '2 GiB per service, OS swap disabled')]:
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = new_chart(title, budget)
         xpos = np.arange(2)
         width = .19
         peak = max(r.get('qps', 0) for r in rows if r['mode'] == mode)
@@ -128,15 +130,11 @@ def main():
                 else:
                     ax.text(x, peak*.025, 'OOM', ha='center', va='bottom',
                             color=COLORS[j], weight='bold', fontsize=11)
-        ax.set_title(f'{title}\n{budget}', fontsize=17, pad=18)
         ax.set_ylabel('QPS (median of 3 repeats)')
         ax.set_xticks(xpos, ['SIFT10M', 'DEEP10M'])
         ax.set_ylim(0, peak*1.18)
-        ax.grid(axis='y', alpha=.18, zorder=0)
-        ax.legend(ncol=4, loc='upper center', bbox_to_anchor=(.5, -.11), frameon=False)
-        fig.tight_layout()
-        fig.savefig(a.assets / f'hnsw_{mode}.png', dpi=180, bbox_inches='tight')
-        plt.close(fig)
+        add_legend(ax, 4)
+        save_chart(fig, a.assets / f'hnsw_{mode}.png')
 
 
 if __name__ == '__main__':
