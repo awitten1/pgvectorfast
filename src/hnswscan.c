@@ -96,6 +96,11 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		return NIL;
 	}
 
+	if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF &&
+		support->vectorDistance != HNSW_VECTOR_DISTANCE_NONE)
+		return HnswSearchIterative(q, ep, hnsw_ef_search, index, support, m,
+								  &so->v, &so->tuples, &so->iterative, true);
+
 	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
 }
 
@@ -358,6 +363,7 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	/* v's visited slots persist across rescans; discarded is allocated in tmpCtx */
 	so->v.tids.count = 0;
 	so->discarded = NULL;
+	so->iterative = NULL;
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
@@ -479,40 +485,62 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 				if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
 					break;
 
-				/* Empty index */
-				if (so->discarded == NULL)
-					break;
-
-				/* Reached max number of tuples or memory limit */
-				if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
+				if (so->iterative != NULL)
 				{
-					if (pairingheap_is_empty(so->discarded))
-						break;
+					bool expand;
 
-					/* Return remaining tuples */
-					so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
+					if (HnswIterativeEmpty(so->iterative))
+						break;
+					expand = so->tuples < hnsw_max_scan_tuples &&
+						MemoryContextMemAllocated(so->tmpCtx, false) <= so->maxMemory;
+					if (expand)
+						LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+					so->w = HnswSearchIterative(&so->q, NIL, expand ? hnsw_ef_search : 1,
+						scan->indexRelation, &so->support, so->m, &so->v,
+						&so->tuples, &so->iterative, expand);
+					if (expand)
+						UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 				}
 				else
 				{
-					/*
-					 * Locking ensures when neighbors are read, the elements they
-					 * reference will not be deleted (and replaced) during the
-					 * iteration.
-					 *
-					 * Elements loaded into memory on previous iterations may have
-					 * been deleted (and replaced), so when reading neighbors, the
-					 * element version must be checked.
-					 */
-					LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+					/* Empty index */
+					if (so->discarded == NULL)
+						break;
 
-					so->w = ResumeScanItems(scan);
+					/* Reached max number of tuples or memory limit */
+					if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
+					{
+						if (pairingheap_is_empty(so->discarded))
+							break;
 
-					UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+						/* Return remaining tuples */
+						so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
+					}
+					else
+					{
+						/*
+						 * Locking ensures when neighbors are read, the elements they
+						 * reference will not be deleted (and replaced) during the
+						 * iteration.
+						 *
+						 * Elements loaded into memory on previous iterations may have
+						 * been deleted (and replaced), so when reading neighbors, the
+						 * element version must be checked.
+						 */
+						LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+						so->w = ResumeScanItems(scan);
+
+						UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
 
 #if defined(HNSW_MEMORY)
-					ShowMemoryUsage(so);
+						ShowMemoryUsage(so);
 #endif
+					}
 				}
+				so->heap_pref_count = 0;
+				so->heap_pref_idx = 0;
+				HnswPrefetchHeapResults(scan, so);
 
 				if (list_length(so->w) == 0)
 					break;

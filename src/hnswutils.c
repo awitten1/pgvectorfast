@@ -2299,6 +2299,346 @@ HnswLoadFastCandSlow(BlockNumber blkno, OffsetNumber offno,
 	return false;
 }
 
+/*
+ * Compact queues live in the scan context and retain discarded candidates
+ * across batches. Heap TIDs are copied during the validated vector read into
+ * an arena: returning a candidate never needs to reread its index tuple.
+ * Only the at-most-ef returned candidates allocate full search objects.
+ */
+typedef struct HnswIterativeCand
+{
+	HnswFastCand graph;
+	uint32 heap_offset;
+	uint8 heap_count;
+} HnswIterativeCand;
+
+struct HnswIterativeState
+{
+	HnswIterativeCand *pending;
+	HnswIterativeCand *candidates;
+	HnswIterativeCand *results;
+	int pending_count;
+	int pending_capacity;
+	int candidate_capacity;
+	int result_capacity;
+	ItemPointerData *heap_tids;
+	uint32 heap_count;
+	uint32 heap_capacity;
+};
+
+bool
+HnswIterativeEmpty(HnswIterativeState *state)
+{
+	return state->pending_count == 0;
+}
+
+/* Offsets remain valid when the arena grows. Retain the original heap TIDs,
+ * like the generic iterator, so a later VACUUM/reuse cannot substitute rows. */
+static inline HnswIterativeCand
+HnswIterativeRemember(HnswIterativeState *state, HnswElement el,
+					  BlockNumber block, OffsetNumber offset, double distance)
+{
+	HnswIterativeCand cand;
+	uint32 needed = state->heap_count + el->heaptidsLength;
+
+	if (needed > state->heap_capacity)
+	{
+		Size capacity = Max((Size) state->heap_capacity * 2, (Size) needed);
+		Size bytes = mul_size(sizeof(ItemPointerData), capacity);
+
+		/* palloc's size limit also bounds the arena's 32-bit offsets. */
+		state->heap_tids = repalloc(state->heap_tids, bytes);
+		state->heap_capacity = capacity;
+	}
+	cand.graph.distance = distance;
+	cand.graph.blkno = block;
+	cand.graph.offno = offset;
+	cand.graph.neighborPage = el->neighborPage;
+	cand.graph.neighborOffno = el->neighborOffno;
+	cand.graph.level = el->level;
+	cand.graph.version = el->version;
+	cand.heap_offset = state->heap_count;
+	cand.heap_count = el->heaptidsLength;
+	memcpy(state->heap_tids + state->heap_count, el->heaptids,
+		   sizeof(ItemPointerData) * el->heaptidsLength);
+	state->heap_count = needed;
+	return cand;
+}
+
+static inline void
+HnswIterativePush(const HnswIterativeCand *cand, HnswIterativeCand **heap,
+				  int *count, int *capacity)
+{
+	int pos;
+
+	if (*count == *capacity)
+	{
+		Size new_capacity = (Size) *capacity * 2;
+
+		*heap = repalloc(*heap, mul_size(sizeof(HnswIterativeCand), new_capacity));
+		*capacity = new_capacity;
+	}
+	pos = (*count)++;
+	while (pos > 0)
+	{
+		int parent = (pos - 1) / 2;
+
+		if (cand->graph.distance >= (*heap)[parent].graph.distance)
+			break;
+		(*heap)[pos] = (*heap)[parent];
+		pos = parent;
+	}
+	(*heap)[pos] = *cand;
+}
+
+static inline void
+HnswIterativeSiftDownMin(HnswIterativeCand *heap, int count)
+{
+	HnswIterativeCand cand = heap[0];
+	int pos = 0;
+
+	while (pos < count / 2)
+	{
+		int child = 2 * pos + 1;
+
+		if (child + 1 < count && heap[child + 1].graph.distance < heap[child].graph.distance)
+			child++;
+		if (cand.graph.distance <= heap[child].graph.distance)
+			break;
+		heap[pos] = heap[child];
+		pos = child;
+	}
+	heap[pos] = cand;
+}
+
+static inline HnswIterativeCand
+HnswIterativePop(HnswIterativeState *state)
+{
+	HnswIterativeCand cand = state->pending[0];
+
+	state->pending[0] = state->pending[--state->pending_count];
+	if (state->pending_count > 0)
+		HnswIterativeSiftDownMin(state->pending, state->pending_count);
+	return cand;
+}
+
+static inline void
+HnswIterativeSiftDownMax(HnswIterativeCand *heap, int count)
+{
+	HnswIterativeCand cand = heap[0];
+	int pos = 0;
+
+	while (pos < count / 2)
+	{
+		int child = 2 * pos + 1;
+
+		if (child + 1 < count && heap[child + 1].graph.distance > heap[child].graph.distance)
+			child++;
+		if (cand.graph.distance >= heap[child].graph.distance)
+			break;
+		heap[pos] = heap[child];
+		pos = child;
+	}
+	heap[pos] = cand;
+}
+
+static inline void
+HnswIterativeAddResult(HnswIterativeState *state, const HnswIterativeCand *cand,
+					   int *count)
+{
+	int pos = (*count)++;
+
+	while (pos > 0)
+	{
+		int parent = (pos - 1) / 2;
+
+		if (cand->graph.distance <= state->results[parent].graph.distance)
+			break;
+		state->results[pos] = state->results[parent];
+		pos = parent;
+	}
+	state->results[pos] = *cand;
+}
+
+static inline void
+HnswIterativeCommit(HnswIterativeState *state, const HnswIterativeCand *cand,
+				   int ef, int *candidate_count, int *result_count)
+{
+	if (*result_count == ef && cand->graph.distance >= state->results[0].graph.distance)
+	{
+		HnswIterativePush(cand, &state->pending, &state->pending_count,
+						 &state->pending_capacity);
+		return;
+	}
+	HnswIterativePush(cand, &state->candidates, candidate_count,
+					 &state->candidate_capacity);
+	if (*result_count < ef)
+		HnswIterativeAddResult(state, cand, result_count);
+	else
+	{
+		HnswIterativePush(&state->results[0], &state->pending,
+						 &state->pending_count, &state->pending_capacity);
+		state->results[0] = *cand;
+		HnswIterativeSiftDownMax(state->results, *result_count);
+	}
+}
+
+/* Heap MVCC checks the retained tuple IDs; neighbor versions are checked
+ * separately by HnswLoadUnvisitedRaw whenever a candidate is expanded. */
+static HnswSearchCandidate *
+HnswMaterializeIterative(HnswIterativeState *state,
+						const HnswIterativeCand *cand)
+{
+	HnswElement el = HnswInitElementFromBlock(cand->graph.blkno, cand->graph.offno);
+
+	el->level = cand->graph.level;
+	el->version = cand->graph.version;
+	el->neighborPage = cand->graph.neighborPage;
+	el->neighborOffno = cand->graph.neighborOffno;
+	el->heaptidsLength = cand->heap_count;
+	memcpy(el->heaptids, state->heap_tids + cand->heap_offset,
+		   sizeof(ItemPointerData) * cand->heap_count);
+	return HnswInitSearchCandidate(NULL, el, cand->graph.distance);
+}
+
+List *
+HnswSearchIterative(HnswQuery *q, List *ep, int ef, Relation index,
+				   HnswSupport *support, int m, visited_hash *v, int64 *tuples,
+				   HnswIterativeState **state_ptr, bool expand)
+{
+	HnswIterativeState *state = *state_ptr;
+	int candidate_count = 0;
+	int result_count = 0;
+	int lm = HnswGetLayerM(m, 0);
+	HnswUnvisited unvisited[HNSW_MAX_M * 2];
+	CalicoOptimisticSlot slots[HNSW_MAX_M * 2];
+	CalicoAsyncBatch *batch = NULL;
+	const Vector *query = (const Vector *) DatumGetPointer(q->value);
+	Size vec_size = query != NULL ? VECTOR_SIZE(query->dim) : 0;
+	Size minimum = offsetof(HnswElementTupleData, data) + vec_size;
+	Size prefetch = hnsw_enable_prefetch ? Min(minimum, (Size) 1024) : 0;
+	bool optimistic = calico_enable_optimistic_reads && calico_is_active() &&
+		!RelationUsesLocalBuffers(index);
+	List *result = NIL;
+
+	Assert(support->vectorDistance != HNSW_VECTOR_DISTANCE_NONE);
+	Assert(ef > 0 && lm <= lengthof(unvisited));
+	if (state == NULL)
+	{
+		ListCell *cell;
+
+		state = palloc0(sizeof(*state));
+		state->pending_capacity = state->candidate_capacity = Max(ef, 256);
+		state->pending = palloc_array_checked(HnswIterativeCand, state->pending_capacity);
+		state->candidates = palloc_array_checked(HnswIterativeCand, state->candidate_capacity);
+		state->heap_capacity = Max(ef, 256);
+		state->heap_tids = palloc_array_checked(ItemPointerData, state->heap_capacity);
+		state->result_capacity = ef;
+		state->results = palloc_array_checked(HnswIterativeCand, ef);
+		*state_ptr = state;
+		InitVisited(NULL, v, false, ef, m, NULL, 0);
+		foreach(cell, ep)
+		{
+			HnswSearchCandidate *sc = lfirst(cell);
+			HnswElement el = HnswPtrAccess((char *) NULL, sc->element);
+			HnswIterativeCand cand;
+			bool found;
+
+			AddToVisited(NULL, v, sc->element, false, &found);
+			(*tuples)++;
+			cand = HnswIterativeRemember(state, el, el->blkno, el->offno, sc->distance);
+			HnswIterativePush(&cand, &state->pending, &state->pending_count,
+							 &state->pending_capacity);
+		}
+	}
+	if (ef > state->result_capacity)
+	{
+		state->results = repalloc(state->results, mul_size(sizeof(HnswIterativeCand), ef));
+		state->result_capacity = ef;
+	}
+	for (int i = 0; i < ef && state->pending_count > 0; i++)
+	{
+		HnswIterativeCand cand = HnswIterativePop(state);
+
+		HnswIterativePush(&cand, &state->candidates, &candidate_count,
+						 &state->candidate_capacity);
+		HnswIterativeAddResult(state, &cand, &result_count);
+	}
+	while (expand && candidate_count > 0)
+	{
+		HnswIterativeCand cand = state->candidates[0];
+		int count;
+		bool processed[HNSW_MAX_M * 2] = {false};
+		bool asynchronous;
+
+		CHECK_FOR_INTERRUPTS();
+		if (cand.graph.distance > state->results[0].graph.distance)
+			break;
+		state->candidates[0] = state->candidates[--candidate_count];
+		if (candidate_count > 0)
+			HnswIterativeSiftDownMin(state->candidates, candidate_count);
+		HnswLoadUnvisitedRaw(cand.graph.neighborPage, cand.graph.neighborOffno,
+			cand.graph.level, cand.graph.version, unvisited, &count, v, index, support,
+			m, lm, 0, slots, prefetch, minimum, NULL, &batch);
+		(*tuples) += count;
+		asynchronous = batch != NULL && batch->active;
+		/* Score resident neighbors while their siblings are being read. */
+		for (int pass = 0; pass < (asynchronous ? 2 : 1); pass++)
+		{
+			if (pass == 1)
+			{
+				BlockNumber blocks[HNSW_MAX_M * 2];
+
+				CalicoAsyncBatchFinish(batch);
+				for (int i = 0; i < count; i++)
+					blocks[i] = ItemPointerGetBlockNumber(&unvisited[i].indextid);
+				calico_optimistic_lookup_batch_slots(&support->read_handle, blocks, count, slots);
+			}
+			for (int i = 0; i < count; i++)
+			{
+				HnswIterativeCand next;
+				HnswElementData element_data;
+				HnswElement element = &element_data;
+				double distance;
+				BlockNumber block = ItemPointerGetBlockNumber(&unvisited[i].indextid);
+				OffsetNumber offset = ItemPointerGetOffsetNumber(&unvisited[i].indextid);
+
+				if (processed[i] || (asynchronous && pass == 0 &&
+					(!slots[i].resident || !slots[i].opt_valid)))
+					continue;
+				if (hnsw_enable_prefetch && i + HNSW_PREFETCH_AHEAD < count)
+					HnswPrefetchSlotTuple(&slots[i + HNSW_PREFETCH_AHEAD],
+						ItemPointerGetOffsetNumber(&unvisited[i + HNSW_PREFETCH_AHEAD].indextid), prefetch);
+				if (optimistic && HnswLoadElementOptimisticSlot(support,
+					block, offset, &slots[i], &distance, query, vec_size, NULL, &element))
+					processed[i] = true;
+				else if (asynchronous && pass == 0)
+					continue;
+				else
+				{
+					HnswLoadElementImpl(block, offset, &distance, q, index, support,
+						false, NULL, &element);
+					processed[i] = true;
+				}
+				next = HnswIterativeRemember(state, element, block, offset, distance);
+				HnswIterativeCommit(state, &next, ef, &candidate_count, &result_count);
+			}
+		}
+	}
+	if (batch != NULL)
+		pfree(batch);
+	while (result_count > 0)
+	{
+		HnswSearchCandidate *sc = HnswMaterializeIterative(state, &state->results[0]);
+
+		result = lappend(result, sc);
+		state->results[0] = state->results[--result_count];
+		if (result_count > 0)
+			HnswIterativeSiftDownMax(state->results, result_count);
+	}
+	return result;
+}
+
 static pg_noinline void
 HnswEvalAsyncUnvisitedBatchFast(HnswQuery * q, int ef, int lc,
 								Relation index, HnswSupport * support,

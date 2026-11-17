@@ -454,6 +454,8 @@ typedef struct HnswFastResultCand
 	uint16		_pad;
 }			HnswFastResultCand;
 
+typedef struct HnswIterativeState HnswIterativeState;
+
 typedef struct HnswScanOpaqueData
 {
 	const		HnswTypeInfo *typeInfo;
@@ -463,6 +465,7 @@ typedef struct HnswScanOpaqueData
 	bool		visited_cb_registered;
 	MemoryContextCallback visited_cb;
 	pairingheap *discarded;
+	HnswIterativeState *iterative;
 	HnswQuery	q;
 	int			m;
 	int64		tuples;
@@ -521,6 +524,8 @@ int			HnswGetM(Relation index);
 int			HnswGetEfConstruction(Relation index);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
+bool HnswIterativeEmpty(HnswIterativeState *state);
+List *HnswSearchIterative(HnswQuery *q, List *ep, int ef, Relation index, HnswSupport *support, int m, visited_hash *v, int64 *tuples, HnswIterativeState **state, bool expand);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
 bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
