@@ -303,12 +303,20 @@ typedef struct HnswTypeInfo
 	void		(*checkValue) (Pointer v);
 }			HnswTypeInfo;
 
+typedef enum HnswVectorDistance
+{
+	HNSW_VECTOR_DISTANCE_NONE,
+	HNSW_VECTOR_DISTANCE_L2,
+	HNSW_VECTOR_DISTANCE_INNER_PRODUCT
+} HnswVectorDistance;
+
 typedef struct HnswSupport
 {
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
 	CalicoReadHandle read_handle;
+	HnswVectorDistance vectorDistance;
 }			HnswSupport;
 
 typedef struct HnswQuery

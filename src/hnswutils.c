@@ -7,6 +7,7 @@
 #include "common/hashfn.h"
 #include "fmgr.h"
 extern Datum vector_l2_squared_distance(PG_FUNCTION_ARGS);
+extern Datum vector_negative_inner_product(PG_FUNCTION_ARGS);
 #include "hnsw.h"
 #include "lib/pairingheap.h"
 #include "nodes/pg_list.h"
@@ -161,6 +162,10 @@ void
 HnswInitSupport(HnswSupport * support, Relation index)
 {
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
+	support->vectorDistance = support->procinfo->fn_addr == vector_l2_squared_distance
+		? HNSW_VECTOR_DISTANCE_L2
+		: (support->procinfo->fn_addr == vector_negative_inner_product
+		   ? HNSW_VECTOR_DISTANCE_INNER_PRODUCT : HNSW_VECTOR_DISTANCE_NONE);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
 	calico_read_handle_init(&support->read_handle, &index->rd_locator, MAIN_FORKNUM);
@@ -615,11 +620,11 @@ HnswOptimisticItem(Page page, OffsetNumber offno, Size minimum)
 }
 
 /*
- * Calculate L2 squared distance optimistically - assumes 'a' is stable but 'b' may be modified
+ * Calculate a supported vector distance optimistically - assumes 'a' is stable but 'b' may be modified
  * Directly computes distance without copying by validating varlena header first
  */
 static inline bool
-HnswGetDistanceOptimistic(const Vector *a_vec, const Vector *b_ptr, Size vec_size, double *distance_out)
+HnswGetDistanceOptimistic(HnswSupport *support, const Vector *a_vec, const Vector *b_ptr, Size vec_size, double *distance_out)
 {
 	uint32		vl_len = __atomic_load_n((const uint32 *) &b_ptr->vl_len_, __ATOMIC_RELAXED);
 	int16		b_dim = __atomic_load_n((const int16 *) &b_ptr->dim, __ATOMIC_RELAXED);
@@ -628,7 +633,11 @@ HnswGetDistanceOptimistic(const Vector *a_vec, const Vector *b_ptr, Size vec_siz
 				 (vl_len >> 2) != (uint32) vec_size || (vl_len & 0x03) != 0))
 		return false;
 
-	*distance_out = (double) VectorL2SquaredDistance(b_dim, a_vec->x, b_ptr->x);
+	Assert(support->vectorDistance != HNSW_VECTOR_DISTANCE_NONE);
+	if (support->vectorDistance == HNSW_VECTOR_DISTANCE_L2)
+		*distance_out = (double) VectorL2SquaredDistance(b_dim, a_vec->x, b_ptr->x);
+	else
+		*distance_out = (double) -VectorInnerProduct(b_dim, a_vec->x, b_ptr->x);
 	return true;
 }
 
@@ -701,10 +710,10 @@ HnswLoadElementFromTupleOptimistic(HnswElement element, HnswElementTuple etup,
 
 /*
  * Try loading and/or scoring an element optimistically from a resolved slot.
- * Precondition: optimistic L2 path is enabled and !loadVec.
+ * Precondition: optimistic vector distance path is enabled and !loadVec.
  */
 static pg_attribute_always_inline bool
-HnswLoadElementOptimisticSlot(BlockNumber blkno, OffsetNumber offno,
+HnswLoadElementOptimisticSlot(HnswSupport *support, BlockNumber blkno, OffsetNumber offno,
 							  const CalicoOptimisticSlot *slot,
 							  double *distance, const Vector *a_vec,
 							  Size vec_size, double *maxDistance,
@@ -728,7 +737,7 @@ HnswLoadElementOptimisticSlot(BlockNumber blkno, OffsetNumber offno,
 								  offsetof(HnswElementTupleData, data) + vec_size);
 		if (unlikely(etup == NULL || etup->deleted))
 			return false;
-		if (unlikely(!HnswGetDistanceOptimistic(a_vec, &etup->data, vec_size, distance)))
+		if (unlikely(!HnswGetDistanceOptimistic(support, a_vec, &etup->data, vec_size, distance)))
 			return false;
 	}
 	else
@@ -773,7 +782,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	 * This avoids taking buffer locks for read-only access.
 	 */
 	if (calico_enable_optimistic_reads && !loadVec &&
-	    support->procinfo->fn_addr == vector_l2_squared_distance &&
+	    support->vectorDistance != HNSW_VECTOR_DISTANCE_NONE &&
 	    calico_is_active() && !RelationUsesLocalBuffers(index))
 	{
 		const Vector *a_vec = (const Vector *) DatumGetPointer(q->value);
@@ -811,7 +820,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 			slot.resident = true;
 			slot.opt_valid = true;
 
-			if (HnswLoadElementOptimisticSlot(blkno, offno, &slot,
+			if (HnswLoadElementOptimisticSlot(support, blkno, offno, &slot,
 											  distance, a_vec, vec_size,
 											  maxDistance, element))
 				return;
@@ -2142,7 +2151,7 @@ HnswFastCommitCand(const HnswFastCand *cand, int ef, int lc,
 }
 
 static pg_attribute_always_inline bool
-HnswLoadElementOptimisticSlotFast(BlockNumber blkno, OffsetNumber offno,
+HnswLoadElementOptimisticSlotFast(HnswSupport *support, BlockNumber blkno, OffsetNumber offno,
 								  const CalicoOptimisticSlot *slot,
 								  HnswElementTuple cached_etup,
 								  const Vector *a_vec, Size vec_size,
@@ -2184,7 +2193,7 @@ HnswLoadElementOptimisticSlotFast(BlockNumber blkno, OffsetNumber offno,
 
 	if (likely(a_vec != NULL))
 	{
-		if (unlikely(!HnswGetDistanceOptimistic(a_vec, &etup->data, vec_size, &dist)))
+		if (unlikely(!HnswGetDistanceOptimistic(support, a_vec, &etup->data, vec_size, &dist)))
 			return false;
 	}
 	else
@@ -2221,7 +2230,7 @@ HnswLoadElementOptimisticSlotFast(BlockNumber blkno, OffsetNumber offno,
 static pg_noinline bool
 HnswLoadFastCandSlow(BlockNumber blkno, OffsetNumber offno,
 					 HnswQuery * q, Relation index, HnswSupport * support,
-					 bool canOptL2, const Vector *a_vec, Size vec_size,
+					 bool canOptDistance, const Vector *a_vec, Size vec_size,
 					 double maxDistance, bool alwaysAdd,
 					 HnswFastCand *cand_out)
 {
@@ -2230,7 +2239,7 @@ HnswLoadFastCandSlow(BlockNumber blkno, OffsetNumber offno,
 	HnswElementTuple etup;
 	double		dist;
 
-	if (canOptL2)
+	if (canOptDistance)
 	{
 		bool		found = false;
 		uint64		version = 0;
@@ -2249,7 +2258,7 @@ HnswLoadFastCandSlow(BlockNumber blkno, OffsetNumber offno,
 			retry_slot.frame_id = buf_id;
 			retry_slot.resident = true;
 			retry_slot.opt_valid = true;
-			if (HnswLoadElementOptimisticSlotFast(blkno, offno, &retry_slot, NULL,
+			if (HnswLoadElementOptimisticSlotFast(support, blkno, offno, &retry_slot, NULL,
 												  a_vec, vec_size,
 												  maxDistance, alwaysAdd,
 												  cand_out, &accepted))
@@ -2293,7 +2302,7 @@ HnswLoadFastCandSlow(BlockNumber blkno, OffsetNumber offno,
 static pg_noinline void
 HnswEvalAsyncUnvisitedBatchFast(HnswQuery * q, int ef, int lc,
 								Relation index, HnswSupport * support,
-								bool canOptL2, const Vector *queryVec,
+								bool canOptDistance, const Vector *queryVec,
 								Size optVecSize, Size optPrefetchBytes,
 								HnswUnvisited * unvisited, int unvisitedLength,
 								CalicoOptimisticSlot *unvisited_slots,
@@ -2337,8 +2346,8 @@ HnswEvalAsyncUnvisitedBatchFast(HnswQuery * q, int ef, int lc,
 								  optPrefetchBytes);
 		}
 
-		if (canOptL2 &&
-			HnswLoadElementOptimisticSlotFast(blkno, offno, &unvisited_slots[idx], NULL,
+		if (canOptDistance &&
+			HnswLoadElementOptimisticSlotFast(support, blkno, offno, &unvisited_slots[idx], NULL,
 											  queryVec, optVecSize,
 											  maxDist, alwaysAdd,
 											  &cand, &accepted))
@@ -2407,8 +2416,8 @@ HnswEvalAsyncUnvisitedBatchFast(HnswQuery * q, int ef, int lc,
 									  optPrefetchBytes);
 			}
 
-			if (canOptL2 &&
-				HnswLoadElementOptimisticSlotFast(blkno, offno, &unvisited_slots[idx], NULL,
+			if (canOptDistance &&
+				HnswLoadElementOptimisticSlotFast(support, blkno, offno, &unvisited_slots[idx], NULL,
 												  queryVec, optVecSize,
 												  maxDist, alwaysAdd,
 												  &cand, &accepted))
@@ -2419,7 +2428,7 @@ HnswEvalAsyncUnvisitedBatchFast(HnswQuery * q, int ef, int lc,
 									   w_heap, wlen);
 			}
 			else if (HnswLoadFastCandSlow(blkno, offno, q, index, support,
-										  canOptL2, queryVec, optVecSize,
+										  canOptDistance, queryVec, optVecSize,
 										  maxDist, alwaysAdd, &cand))
 			{
 				HnswFastCommitCand(&cand, ef, lc,
@@ -2678,7 +2687,7 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 							int ef, int lc,
 							Relation index, HnswSupport * support, int m,
 							visited_hash * v, bool initVisited, int64 *tuples,
-							bool have_opt_l2, bool canOptL2,
+							bool have_opt_distance, bool canOptDistance,
 							const Vector *queryVec, Size optVecSize,
 							Size optPrefetchBytes,
 							HnswFastResultCand *inline_buf, int inline_cap,
@@ -2740,19 +2749,19 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 		cand_etups = palloc_array_checked(HnswElementTuple, lm);
 	}
 
-	if (!have_opt_l2)
+	if (!have_opt_distance)
 	{
-		canOptL2 = false;
+		canOptDistance = false;
 		queryVec = NULL;
 		optVecSize = 0;
 		optPrefetchBytes = 0;
 
 		if (optActive &&
-			support->procinfo->fn_addr == vector_l2_squared_distance)
+			support->vectorDistance != HNSW_VECTOR_DISTANCE_NONE)
 		{
 			if (DatumGetPointer(q->value) == NULL)
 			{
-				canOptL2 = true;
+				canOptDistance = true;
 				optPrefetchBytes = offsetof(HnswElementTupleData, data);
 			}
 			else
@@ -2763,7 +2772,7 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 					optVecSize = VECTOR_SIZE(queryVec->dim);
 					if (likely(optVecSize <= BLCKSZ - offsetof(HnswElementTupleData, data)))
 					{
-						canOptL2 = true;
+						canOptDistance = true;
 						optPrefetchBytes = Min(offsetof(HnswElementTupleData, data) + optVecSize,
 											   (Size) 1024);
 					}
@@ -2908,7 +2917,7 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 							 unvisited, &unvisitedLength, v, index, support,
 							 m, lm, lc, unvisited_slots,
 							 rawPrefetchBytes, minValidBytes,
-							 canOptL2 ? cand_etups : NULL,
+							 canOptDistance ? cand_etups : NULL,
 							 &async_batch);
 
 		if (tuples != NULL)
@@ -2957,8 +2966,8 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 					p0_stage = 3;
 				}
 
-				if (canOptL2 &&
-					HnswLoadElementOptimisticSlotFast(blkno, offno, &unvisited_slots[i],
+				if (canOptDistance &&
+					HnswLoadElementOptimisticSlotFast(support, blkno, offno, &unvisited_slots[i],
 													  cand_etups[i],
 													  queryVec, optVecSize,
 													  maxDist, alwaysAdd,
@@ -2983,7 +2992,7 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 					}
 				}
 				else if (HnswLoadFastCandSlow(blkno, offno, q, index, support,
-											  canOptL2, queryVec, optVecSize,
+											  canOptDistance, queryVec, optVecSize,
 											  maxDist, alwaysAdd, &cand))
 				{
 					HnswFastCommitCand(&cand, ef, lc,
@@ -3020,7 +3029,7 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 		else
 		{
 			HnswEvalAsyncUnvisitedBatchFast(q, ef, lc, index, support,
-											canOptL2, queryVec, optVecSize,
+											canOptDistance, queryVec, optVecSize,
 											optPrefetchBytes,
 											unvisited, unvisitedLength,
 											unvisited_slots, async_batch,
@@ -3122,7 +3131,7 @@ HnswSearchLayerFastCands(char *base, HnswQuery * q, List *ep, int ef, int lc,
 static pg_noinline void
 HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 							 Relation index, HnswSupport * support, int m,
-							 bool canOptL2, const Vector *queryVec,
+							 bool canOptDistance, const Vector *queryVec,
 							 Size optVecSize, Size optPrefetchBytes,
 							 HnswFastCand *best_out)
 {
@@ -3132,7 +3141,7 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 	bool		ep_loaded = false;
 	Size		minValidBytes = offsetof(HnswElementTupleData, data) + optVecSize;
 
-	if (likely(canOptL2))
+	if (likely(canOptDistance))
 	{
 		uint64		opt_ver = 0;
 		uint32		buf_id = 0;
@@ -3153,7 +3162,7 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 			ep_slot.opt_valid = true;
 			etup = HnswPrefetchSlotTupleEx(&ep_slot, entryPoint->offno,
 										   optPrefetchBytes, minValidBytes);
-			if (likely(HnswLoadElementOptimisticSlotFast(entryPoint->blkno,
+			if (likely(HnswLoadElementOptimisticSlotFast(support, entryPoint->blkno,
 														 entryPoint->offno,
 														 &ep_slot, etup,
 														 queryVec, optVecSize,
@@ -3167,7 +3176,7 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 	{
 		if (unlikely(!HnswLoadFastCandSlow(entryPoint->blkno, entryPoint->offno,
 										   q, index, support,
-										   canOptL2, queryVec, optVecSize,
+										   canOptDistance, queryVec, optVecSize,
 										   0.0, true, &best)))
 			elog(ERROR, "failed to load entry point element");
 	}
@@ -3186,7 +3195,7 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 		CalicoAsyncBatch *async_batch = NULL;
 		const bool	doPrefetch = hnsw_enable_prefetch;
 		const Size	rawPrefetchBytes = doPrefetch ? optPrefetchBytes : 0;
-		const bool	use_static_visited = (canOptL2 && m <= 48);
+		const bool	use_static_visited = (canOptDistance && m <= 48);
 
 		if (likely(lm_max <= lengthof(stack_unvisited)))
 		{
@@ -3251,7 +3260,7 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 									 m, lm, lc, unvisited_slots,
 									 rawPrefetchBytes,
 									 minValidBytes,
-									 canOptL2 ? cand_etups : NULL,
+									 canOptDistance ? cand_etups : NULL,
 									 &async_batch);
 
 				if (likely(async_batch == NULL || !async_batch->active))
@@ -3272,8 +3281,8 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 														optPrefetchBytes, minValidBytes);
 						}
 
-						if (canOptL2 &&
-							HnswLoadElementOptimisticSlotFast(blkno, offno, &unvisited_slots[i],
+						if (canOptDistance &&
+							HnswLoadElementOptimisticSlotFast(support, blkno, offno, &unvisited_slots[i],
 															  cand_etups[i],
 															  queryVec, optVecSize,
 															  best.distance, false,
@@ -3286,7 +3295,7 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 							}
 						}
 						else if (HnswLoadFastCandSlow(blkno, offno, q, index, support,
-													  canOptL2, queryVec, optVecSize,
+													  canOptDistance, queryVec, optVecSize,
 													  best.distance, false, &cand))
 						{
 							if (likely(cand.level >= lc))
@@ -3313,7 +3322,7 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 					w_one._pad = 0;
 
 					HnswEvalAsyncUnvisitedBatchFast(q, 1, lc, index, support,
-													canOptL2, queryVec, optVecSize,
+													canOptDistance, queryVec, optVecSize,
 													optPrefetchBytes,
 													unvisited, unvisitedLength,
 													unvisited_slots, async_batch,
@@ -3341,7 +3350,7 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 						{
 							if (unlikely(!HnswLoadFastCandSlow(w_one.blkno, w_one.offno,
 															   q, index, support,
-															   canOptL2, queryVec, optVecSize,
+															   canOptDistance, queryVec, optVecSize,
 															   0.0, true, &best)))
 								elog(ERROR, "failed to load upper layer candidate");
 						}
@@ -3376,7 +3385,7 @@ HnswSearchLayerFromEntryFastCands(char *base, HnswQuery * q, HnswElement entryPo
 								  HnswFastResultCand *inline_buf, int inline_cap,
 								  HnswFastResultCand **fast_out, int *fast_count_out)
 {
-	bool		canOptL2 = false;
+	bool		canOptDistance = false;
 	const Vector *queryVec = NULL;
 	Size		optVecSize = 0;
 	Size		optPrefetchBytes = 0;
@@ -3389,11 +3398,11 @@ HnswSearchLayerFromEntryFastCands(char *base, HnswQuery * q, HnswElement entryPo
 		support != NULL &&
 		calico_is_active() && !RelationUsesLocalBuffers(index))
 	{
-		if (support->procinfo->fn_addr == vector_l2_squared_distance)
+		if (support->vectorDistance != HNSW_VECTOR_DISTANCE_NONE)
 		{
 			if (DatumGetPointer(q->value) == NULL)
 			{
-				canOptL2 = true;
+				canOptDistance = true;
 				optPrefetchBytes = offsetof(HnswElementTupleData, data);
 			}
 			else
@@ -3404,7 +3413,7 @@ HnswSearchLayerFromEntryFastCands(char *base, HnswQuery * q, HnswElement entryPo
 					optVecSize = VECTOR_SIZE(queryVec->dim);
 					if (likely(optVecSize <= BLCKSZ - offsetof(HnswElementTupleData, data)))
 					{
-						canOptL2 = true;
+						canOptDistance = true;
 						optPrefetchBytes = Min(offsetof(HnswElementTupleData, data) + optVecSize,
 											   (Size) 1024);
 					}
@@ -3418,12 +3427,12 @@ HnswSearchLayerFromEntryFastCands(char *base, HnswQuery * q, HnswElement entryPo
 	}
 
 	HnswSearchLayerUpperDiskFast(q, entryPoint, index, support, m,
-								 canOptL2, queryVec, optVecSize, optPrefetchBytes,
+								 canOptDistance, queryVec, optVecSize, optPrefetchBytes,
 								 &best);
 
 	HnswSearchLayerDiskFastCore(base, q, NIL, &best, ef, 0, index, support, m,
 								v, true, tuples,
-								true, canOptL2, queryVec, optVecSize, optPrefetchBytes,
+								true, canOptDistance, queryVec, optVecSize, optPrefetchBytes,
 								inline_buf, inline_cap, fast_out, fast_count_out);
 	return true;
 }
@@ -3437,7 +3446,7 @@ static pg_noinline void
 HnswEvalAsyncUnvisitedBatch(char *base, HnswQuery * q, int ef, int lc,
 							Relation index, HnswSupport * support,
 							HnswElement skipElement, pairingheap **discarded,
-							bool canOptL2, const Vector *queryVec,
+							bool canOptDistance, const Vector *queryVec,
 							Size optVecSize, Size optPrefetchBytes,
 							HnswUnvisited * unvisited, int unvisitedLength,
 							CalicoOptimisticSlot *unvisited_slots,
@@ -3481,8 +3490,8 @@ HnswEvalAsyncUnvisitedBatch(char *base, HnswQuery * q, int ef, int lc,
 								  optPrefetchBytes);
 		}
 
-		if (canOptL2 &&
-			HnswLoadElementOptimisticSlot(blkno, offno, &unvisited_slots[idx],
+		if (canOptDistance &&
+			HnswLoadElementOptimisticSlot(support, blkno, offno, &unvisited_slots[idx],
 										   &eDistance, queryVec, optVecSize,
 										   maxDistPtr, &eElement))
 		{
@@ -3549,8 +3558,8 @@ HnswEvalAsyncUnvisitedBatch(char *base, HnswQuery * q, int ef, int lc,
 									  optPrefetchBytes);
 			}
 
-			if (!canOptL2 ||
-				!HnswLoadElementOptimisticSlot(blkno, offno, &unvisited_slots[idx],
+			if (!canOptDistance ||
+				!HnswLoadElementOptimisticSlot(support, blkno, offno, &unvisited_slots[idx],
 											   &eDistance, queryVec, optVecSize,
 											   maxDistPtr, &eElement))
 			{
@@ -3586,7 +3595,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	CalicoOptimisticSlot *unvisited_slots;
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
-	bool		canOptL2 = false;
+	bool		canOptDistance = false;
 	const Vector *queryVec = NULL;
 	Size		optVecSize = 0;
 	Size		optPrefetchBytes = 0;
@@ -3617,12 +3626,12 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 	if (!inMemory && !inserting && calico_enable_optimistic_reads &&
 		support != NULL &&
-		support->procinfo->fn_addr == vector_l2_squared_distance &&
+		support->vectorDistance != HNSW_VECTOR_DISTANCE_NONE &&
 		calico_is_active() && !RelationUsesLocalBuffers(index))
 	{
 		if (DatumGetPointer(q->value) == NULL)
 		{
-			canOptL2 = true;
+			canOptDistance = true;
 			optPrefetchBytes = offsetof(HnswElementTupleData, data);
 		}
 		else
@@ -3633,7 +3642,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 				optVecSize = VECTOR_SIZE(queryVec->dim);
 				if (likely(optVecSize <= BLCKSZ - offsetof(HnswElementTupleData, data)))
 				{
-					canOptL2 = true;
+					canOptDistance = true;
 					optPrefetchBytes = Min(offsetof(HnswElementTupleData, data) + optVecSize,
 										   (Size) 1024);
 				}
@@ -3756,8 +3765,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 					/* Avoid any allocations if not adding */
 					eElement = NULL;
-					if (!canOptL2 ||
-						!HnswLoadElementOptimisticSlot(blkno, offno, &unvisited_slots[i],
+					if (!canOptDistance ||
+						!HnswLoadElementOptimisticSlot(support, blkno, offno, &unvisited_slots[i],
 													   &eDistance, queryVec, optVecSize,
 													   maxDistPtr, &eElement))
 					{
@@ -3776,7 +3785,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		else
 		{
 			HnswEvalAsyncUnvisitedBatch(base, q, ef, lc, index, support,
-										skipElement, discarded, canOptL2,
+										skipElement, discarded, canOptDistance,
 										queryVec, optVecSize, optPrefetchBytes,
 										unvisited, unvisitedLength,
 										unvisited_slots, async_batch,
