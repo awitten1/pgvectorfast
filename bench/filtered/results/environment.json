@@ -1,0 +1,222 @@
+{
+  "swaps_before": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t16777212\t12501440\t-2\n",
+  "swappiness": "60",
+  "page_cluster": "3",
+  "swap_allowance_gib": 16,
+  "temporary_swap_removed": true,
+  "swap_device": "/dev/nvme0n1p2",
+  "swaps_after": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t16777212\t11914052\t-2\n",
+  "controller_started_at": 1794933013.0588574,
+  "controller_finished_at": 1794939574.0625682,
+  "original_swap_configuration_preserved": true,
+  "captured_at_utc": "2026-11-17T18:20:02.289826+00:00",
+  "swappiness_after": "60",
+  "page_cluster_after": "3",
+  "kernel": "6.8.0-138-generic",
+  "architecture": "x86_64",
+  "cpu": {
+    "lscpu": [
+      {
+        "field": "Architecture:",
+        "data": "x86_64"
+      },
+      {
+        "field": "CPU op-mode(s):",
+        "data": "32-bit, 64-bit"
+      },
+      {
+        "field": "Address sizes:",
+        "data": "46 bits physical, 48 bits virtual"
+      },
+      {
+        "field": "Byte Order:",
+        "data": "Little Endian"
+      },
+      {
+        "field": "CPU(s):",
+        "data": "32"
+      },
+      {
+        "field": "On-line CPU(s) list:",
+        "data": "0-31"
+      },
+      {
+        "field": "Vendor ID:",
+        "data": "GenuineIntel"
+      },
+      {
+        "field": "Model name:",
+        "data": "13th Gen Intel(R) Core(TM) i9-13900K"
+      },
+      {
+        "field": "CPU family:",
+        "data": "6"
+      },
+      {
+        "field": "Model:",
+        "data": "183"
+      },
+      {
+        "field": "Thread(s) per core:",
+        "data": "2"
+      },
+      {
+        "field": "Core(s) per socket:",
+        "data": "24"
+      },
+      {
+        "field": "Socket(s):",
+        "data": "1"
+      },
+      {
+        "field": "Stepping:",
+        "data": "1"
+      },
+      {
+        "field": "CPU max MHz:",
+        "data": "5800.0000"
+      },
+      {
+        "field": "CPU min MHz:",
+        "data": "800.0000"
+      },
+      {
+        "field": "BogoMIPS:",
+        "data": "5990.40"
+      },
+      {
+        "field": "Flags:",
+        "data": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq tme rdpid movdiri movdir64b fsrm md_clear serialize pconfig arch_lbr ibt flush_l1d arch_capabilities ibpb_exit_to_user"
+      },
+      {
+        "field": "Virtualization:",
+        "data": "VT-x"
+      },
+      {
+        "field": "L1d cache:",
+        "data": "896 KiB (24 instances)"
+      },
+      {
+        "field": "L1i cache:",
+        "data": "1.3 MiB (24 instances)"
+      },
+      {
+        "field": "L2 cache:",
+        "data": "32 MiB (12 instances)"
+      },
+      {
+        "field": "L3 cache:",
+        "data": "36 MiB (1 instance)"
+      },
+      {
+        "field": "NUMA node(s):",
+        "data": "1"
+      },
+      {
+        "field": "NUMA node0 CPU(s):",
+        "data": "0-31"
+      },
+      {
+        "field": "Vulnerability Gather data sampling:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Indirect target selection:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Itlb multihit:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability L1tf:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Mds:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Meltdown:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Mmio stale data:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Reg file data sampling:",
+        "data": "Mitigation; Clear Register File"
+      },
+      {
+        "field": "Vulnerability Retbleed:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Spec rstack overflow:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Spec store bypass:",
+        "data": "Mitigation; Speculative Store Bypass disabled via prctl"
+      },
+      {
+        "field": "Vulnerability Spectre v1:",
+        "data": "Mitigation; usercopy/swapgs barriers and __user pointer sanitization"
+      },
+      {
+        "field": "Vulnerability Spectre v2:",
+        "data": "Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S"
+      },
+      {
+        "field": "Vulnerability Srbds:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Tsa:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Tsx async abort:",
+        "data": "Not affected"
+      },
+      {
+        "field": "Vulnerability Vmscape:",
+        "data": "Mitigation; IBPB before exit to userspace"
+      }
+    ]
+  },
+  "python": "3.10.12",
+  "client_packages": {
+    "numpy": "2.2.6",
+    "psycopg": "3.3.9",
+    "pgvector": "0.5.1",
+    "h5py": "3.16.0"
+  },
+  "native_release": "v0.2.1",
+  "native_release_commit": "916c6dd04d9b43f4d8f37203b36809b0ac26fa67",
+  "runner_sha256": {
+    "bench/filtered/build.py": "2d14409f8e6863309b855f0f2f13f542bf3f009fc97712ee1c019a41f3f745c8",
+    "bench/filtered/check_yfcc.py": "6a02405d6fe011e556c1d7ad4acdbaa65505b7d2366245fe548c2fda107b31bf",
+    "bench/filtered/datasets.py": "090dc01135870112cef644bf8fcb2e94f008c2e166826a786c57abfa7c94d8ca",
+    "bench/filtered/run.py": "aff060528040e685b2e3d81cc3bef6ecdb79bdb2c228082b1e7dab3bc6e35320",
+    "bench/filtered/summarize.py": "5d5ffc5086a7637ca44822c1a2295bc384c624c1a5379f6fdaed545d219899ce"
+  },
+  "shared_helper_sha256": "4ce927265a0777e488a3225362638586c83fe9545afe8df7530c2e7f2dfd0a14",
+  "dataset_sources": {
+    "arxiv": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/arxiv.tar.gz"
+  },
+  "scope": "arxiv",
+  "yfcc10m": "cancelled_by_user_before_measurements",
+  "selection": {
+    "seed": 20261117,
+    "calibration_per_filter": 100,
+    "large_ram_timed_per_filter": 300,
+    "small_ram_timed_per_filter": 100,
+    "small_ram_warmup_per_filter": 30,
+    "repeats": 3,
+    "target_calibration_recall": 0.95,
+    "candidate_limit": 50,
+    "k": 10
+  }
+}

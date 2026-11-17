@@ -26,6 +26,8 @@ Based on [pgvector](https://github.com/pgvector/pgvector/), pgvectorfast is a st
 
 See [Detailed Benchmark Results](BENCHMARKS.md) for measured recall, latency breakdowns, and experimental configurations.
 
+See also the [filtered-search comparison on ArXiv](BENCHMARKS.md#filtered-vector-search-arxiv).
+
 ## How It Works
 
 PostgreSQL's default buffer manager translates every page reference through a partitioned shared hash table and acquires atomic pins and buffer content locks on every page read. Across vector index lookups and analytical scans/joins—and especially during HNSW graph traversal, which performs thousands of irregular neighbor lookups per query—page translation, pin/unpin atomic traffic, and synchronous random I/O become major bottlenecks.

@@ -1,6 +1,6 @@
 # Detailed Benchmark Results
 
-The HNSW comparison uses pgvectorfast 0.2.1, upstream pgvector 0.8.7,
+The unfiltered HNSW comparison uses pgvectorfast 0.2.1, upstream pgvector 0.8.7,
 Chroma 1.5.9, and Qdrant 1.20.1 on the same SIFT10M (128D) and DEEP10M (96D)
 vectors.
 
@@ -132,3 +132,59 @@ Because `CALL calico.activate()` upgrades PostgreSQL's shared buffer pool for al
 | Merge Join | **1.88x** |
 | Nested Loop Join | **1.78x** |
 | Indexed Nested Loop Join | **1.52x** |
+
+## Filtered Vector Search: ArXiv
+
+On ArXiv's balanced mix of filters, pgvectorfast delivers **1.80x** the throughput
+at **16 GiB RAM** and **2.38x** at **2 GiB RAM**. Both implementations have identical
+per-query recall and result counts in all three repeats.
+
+These runs compare pgvectorfast 0.2.1 with upstream pgvector 0.8.7 on PostgreSQL 18.7.
+ArXiv contains 2,138,591 384-dimensional vectors with cosine distance and category,
+submitter, and update-date filters. The workload uses the published query
+predicates and filtered ground truth.
+
+Both implementations query the same physical HNSW graph and heap, with metadata
+indexes available to PostgreSQL. The planner chooses the access path for each
+query. HNSW uses iterative relaxed-order scans, retrieving up to 50 filtered
+candidates and sorting them to return the nearest 10. Search budgets are selected
+on separate calibration queries to reach at least 95% mean recall in each filter
+type; the tables below report the actual held-out recall and result completeness.
+
+Each engine has one pinned server CPU, a separate client CPU, and one outstanding
+query. The memory limits are 16 GiB and 2 GiB RAM. Every case
+allows an additional 16 GiB of NVMe-backed swap. Limits include file cache.
+The 16 GiB runs prewarm the benchmark relations. The 2 GiB runs use 1536 MiB
+shared buffers and are checked for physical NVMe reads during timing.
+
+Results are medians of three repeats. Each larger-memory repeat has 300 held-out
+queries per filter type; each 2 GiB repeat uses a fixed subset of 100 per type.
+The same queries and order are used for both implementations. The balanced mix
+gives each filter type equal query counts. QPS includes client API latency.
+
+| Dataset | RAM | Filter | pgvector QPS | pgvectorfast QPS | Speedup | Recall@10 (stock / fast) | Full top-10 (%) (stock / fast) |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| arxiv | 16 GiB | Category | 6.16 | 11.05 | 1.79x | 0.9333 / 0.9333 | 99.7 / 99.7 |
+| arxiv | 16 GiB | Date range | 145.66 | 299.77 | 2.06x | 0.9783 / 0.9783 | 100.0 / 100.0 |
+| arxiv | 16 GiB | Submitter | 2689.59 | 3037.46 | 1.13x | 1.0000 / 1.0000 | 100.0 / 100.0 |
+| arxiv | 16 GiB | Balanced mix | 17.68 | 31.84 | 1.80x | 0.9706 / 0.9706 | 99.9 / 99.9 |
+| arxiv | 2 GiB | Category | 0.08 | 0.19 | 2.33x | 0.9280 / 0.9280 | 99.0 / 99.0 |
+| arxiv | 2 GiB | Date range | 1.87 | 8.55 | 4.58x | 0.9670 / 0.9670 | 100.0 / 100.0 |
+| arxiv | 2 GiB | Submitter | 153.93 | 191.42 | 1.24x | 1.0000 / 1.0000 | 100.0 / 100.0 |
+| arxiv | 2 GiB | Balanced mix | 0.23 | 0.55 | 2.38x | 0.9650 / 0.9650 | 99.7 / 99.7 |
+
+A full top-10 means the query returned all ten requested neighbors. Recall is
+measured against the exact top ten neighbors satisfying the predicate.
+Speedup varies with filter type and PostgreSQL's chosen execution plan.
+Both implementations chose the same plans: all date-range queries used HNSW,
+all submitter queries used the metadata B-tree, and category queries mixed HNSW
+with the metadata GIN index. HNSW handled 153 of 300 category queries in the
+16 GiB sample and 58 of 100 in the 2 GiB sample.
+
+Neither implementation read data from disk during the prewarmed 16 GiB timings.
+Across the three 2 GiB repeats, pgvector read 193.23 GiB and pgvectorfast read
+191.86 GiB from storage. Neither run had an OOM event. The shared search settings
+were `hnsw.ef_search = 200` and `hnsw.max_scan_tuples = 200000`.
+
+[Runner and reproduction instructions](bench/filtered/README.md) ·
+[Raw results, query plans, calibration, and input hashes](bench/filtered/results)

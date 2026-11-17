@@ -1,0 +1,26 @@
+[
+  {
+    "path": "arxiv/filters.json",
+    "bytes": 269271,
+    "mtime_ns": 1665652882000000000,
+    "sha256": "afaaf00f8d43817dd5d0f8528a9ee27a5c88a990b693c68414c9807785636b0f"
+  },
+  {
+    "path": "arxiv/payloads.jsonl",
+    "bytes": 3663647674,
+    "mtime_ns": 1665731963000000000,
+    "sha256": "bb3170ee5fa3d9adf0b5c379880204382bd32380763d7f0ee9db97937126576e"
+  },
+  {
+    "path": "arxiv/tests.jsonl",
+    "bytes": 92796647,
+    "mtime_ns": 1665819165000000000,
+    "sha256": "113ffbbac713cdb3b827473e90c757aa2a96aea25933003408985c437b6dd689"
+  },
+  {
+    "path": "arxiv/vectors.npy",
+    "bytes": 3284875904,
+    "mtime_ns": 1665738636000000000,
+    "sha256": "08810e787851b00aebd2a295c57a1f20af517ebb9ab5bb8f22b1d3166d9b2308"
+  }
+]

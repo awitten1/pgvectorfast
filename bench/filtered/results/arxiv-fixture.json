@@ -1,0 +1,35 @@
+{
+  "dataset": "arxiv",
+  "count": 2138591,
+  "dimensions": 384,
+  "image": "pgvectorfast-021-test:trixie",
+  "image_id": "sha256:4fea28126923b2ccea5cbc50ca7f719a4a024a5f8e9afe07633f641fa273bc66",
+  "hnsw_build_seconds": 303.91778469085693,
+  "total_seconds": 382.1095268726349,
+  "relations": [
+    [
+      "items",
+      4379377664
+    ],
+    [
+      "items_filter",
+      10256384
+    ],
+    [
+      "items_hnsw",
+      4372439040
+    ],
+    [
+      "items_pkey",
+      48062464
+    ],
+    [
+      "items_submitter",
+      29573120
+    ],
+    [
+      "items_updated",
+      15286272
+    ]
+  ]
+}
