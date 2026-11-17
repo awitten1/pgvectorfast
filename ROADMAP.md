@@ -4,3 +4,4 @@
 - [ ] Support Windows.
 - [ ] Support macOS.
 - [ ] Support PostgreSQL 14, 15, 16, and 17.
+- [ ] Support for optimized filtered vector search.
