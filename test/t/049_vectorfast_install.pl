@@ -133,6 +133,8 @@ $node->stop;
 
 my $plain = PostgreSQL::Test::Cluster->new('no_preload');
 $plain->init;
+# Docker images preload vectorfast in postgresql.conf.sample.
+$plain->append_conf('postgresql.conf', "shared_preload_libraries = ''\n");
 $plain->start;
 my ($out, $err) = ('', '');
 isnt($plain->psql('postgres', 'CREATE EXTENSION vectorfast CASCADE;',
