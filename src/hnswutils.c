@@ -627,7 +627,10 @@ HnswOptimisticItem(Page page, OffsetNumber offno, Size minimum)
  * Directly computes distance without copying by validating varlena header first
  */
 static pg_attribute_always_inline bool
-HnswGetDistanceOptimisticImpl(HnswSupport *support, const Vector *a_vec, const Vector *b_ptr, Size vec_size, bool use_avx_fma, double *distance_out)
+HnswGetDistanceOptimisticPrefetchImpl(HnswSupport *support, const Vector *a_vec,
+									   const Vector *b_ptr, Size vec_size,
+									   bool use_avx_fma, const float *pref_bx,
+									   double *distance_out)
 {
 	uint32		vl_len = __atomic_load_n((const uint32 *) &b_ptr->vl_len_, __ATOMIC_RELAXED);
 	int16		b_dim = __atomic_load_n((const int16 *) &b_ptr->dim, __ATOMIC_RELAXED);
@@ -640,20 +643,48 @@ HnswGetDistanceOptimisticImpl(HnswSupport *support, const Vector *a_vec, const V
 #if !defined(VECTOR_NATIVE_AVX_FMA) && defined(USE_DISPATCH)
 	if (use_avx_fma)
 	{
-		if (support->vectorDistance == HNSW_VECTOR_DISTANCE_L2)
-			*distance_out = (double) VectorL2SquaredDistanceAvxFmaInline(b_dim, a_vec->x, b_ptr->x);
+		if (pref_bx != NULL)
+		{
+			if (support->vectorDistance == HNSW_VECTOR_DISTANCE_L2)
+				*distance_out = (double) VectorL2SquaredDistanceAvxFmaPrefetchInline(b_dim, a_vec->x, b_ptr->x, pref_bx);
+			else
+				*distance_out = (double) -VectorInnerProductAvxFmaPrefetchInline(b_dim, a_vec->x, b_ptr->x, pref_bx);
+		}
 		else
-			*distance_out = (double) -VectorInnerProductAvxFmaInline(b_dim, a_vec->x, b_ptr->x);
+		{
+			if (support->vectorDistance == HNSW_VECTOR_DISTANCE_L2)
+				*distance_out = (double) VectorL2SquaredDistanceAvxFmaInline(b_dim, a_vec->x, b_ptr->x);
+			else
+				*distance_out = (double) -VectorInnerProductAvxFmaInline(b_dim, a_vec->x, b_ptr->x);
+		}
+		return true;
+	}
+#elif defined(VECTOR_NATIVE_AVX_FMA)
+	(void) use_avx_fma;
+	if (pref_bx != NULL)
+	{
+		if (support->vectorDistance == HNSW_VECTOR_DISTANCE_L2)
+			*distance_out = (double) VectorL2SquaredDistanceAvxFmaPrefetchInline(b_dim, a_vec->x, b_ptr->x, pref_bx);
+		else
+			*distance_out = (double) -VectorInnerProductAvxFmaPrefetchInline(b_dim, a_vec->x, b_ptr->x, pref_bx);
 		return true;
 	}
 #else
 	(void) use_avx_fma;
+	(void) pref_bx;
 #endif
 	if (support->vectorDistance == HNSW_VECTOR_DISTANCE_L2)
 		*distance_out = (double) VectorL2SquaredDistance(b_dim, a_vec->x, b_ptr->x);
 	else
 		*distance_out = (double) -VectorInnerProduct(b_dim, a_vec->x, b_ptr->x);
 	return true;
+}
+
+static pg_attribute_always_inline bool
+HnswGetDistanceOptimisticImpl(HnswSupport *support, const Vector *a_vec, const Vector *b_ptr, Size vec_size, bool use_avx_fma, double *distance_out)
+{
+	return HnswGetDistanceOptimisticPrefetchImpl(support, a_vec, b_ptr, vec_size,
+												use_avx_fma, NULL, distance_out);
 }
 
 static inline bool
@@ -983,7 +1014,8 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, 
 	return 0;
 }
 
-#define HNSW_BACKEND_VISITED_MAX_CAP (131072U)	/* 1 MB retained per backend */
+#define HNSW_BACKEND_VISITED_MAX_CAP (524288U)	/* 4 MB retained per backend */
+#define HNSW_VISITED_GROW_AT(cap) (((cap) * 25U) >> 5)
 
 typedef struct HnswBackendVisitedCache
 {
@@ -1022,7 +1054,7 @@ HnswAcquireScanVisited(HnswFastVisited *fv, MemoryContext scanCtx, MemoryContext
 		fv->on_stack = false;
 		fv->slots = hnsw_backend_visited.slots;
 		fv->mask = hnsw_backend_visited.cap > 0 ? hnsw_backend_visited.cap - 1 : 0;
-		fv->grow_at = (hnsw_backend_visited.cap * 3) / 4;
+		fv->grow_at = HNSW_VISITED_GROW_AT(hnsw_backend_visited.cap);
 		fv->gen = hnsw_backend_visited.gen;
 
 		if (!*cbRegistered)
@@ -1076,7 +1108,7 @@ static pg_noinline void
 hnsw_fast_visited_grow(HnswFastVisited *fv, uint32 extra)
 {
 	uint32		old_cap = fv->mask + 1;
-	uint32		new_cap = old_cap << 1;
+	uint32		new_cap = (old_cap >= 16384U && old_cap < 262144U) ? (old_cap << 2) : (old_cap << 1);
 	uint64	   *new_slots;
 	uint64	   *old_slots = fv->slots;
 	uint32		new_mask;
@@ -1084,8 +1116,58 @@ hnsw_fast_visited_grow(HnswFastVisited *fv, uint32 extra)
 	bool		was_backend_cache = fv->is_backend_cache;
 	MemoryContext ctx;
 
-	while ((new_cap * 3) / 4 < fv->count + extra && new_cap < (1U << 26))
+	while (HNSW_VISITED_GROW_AT(new_cap) < fv->count + extra && new_cap < (1U << 26))
 		new_cap <<= 1;
+
+	/*
+	 * Fast in-place promotion within the retained 4 MB backend buffer via
+	 * single-pass eviction rehash under a new generation tag.
+	 */
+	if (fv->is_backend_cache &&
+		hnsw_backend_visited.slots != NULL &&
+		old_slots == hnsw_backend_visited.slots &&
+		new_cap <= hnsw_backend_visited.cap &&
+		likely(hnsw_backend_visited.gen < UINT16_MAX))
+	{
+		uint16		next_gen = (uint16) (hnsw_backend_visited.gen + 1U);
+		uint64		new_gen_prefix = (uint64) next_gen << 48;
+
+		hnsw_backend_visited.gen = next_gen;
+		new_mask = new_cap - 1;
+
+		for (uint32 i = 0; i < old_cap; i++)
+		{
+			uint64		val = old_slots[i];
+
+			if ((uint16) (val >> 48) != gen)
+				continue;
+
+			old_slots[i] = 0;
+			val &= UINT64CONST(0x0000ffffffffffff);
+			for (;;)
+			{
+				uint32		pos = hnsw_hash_tid48(val) & new_mask;
+				uint64		displaced;
+
+				while ((uint16) (old_slots[pos] >> 48) == next_gen)
+					pos = (pos + 1) & new_mask;
+
+				displaced = old_slots[pos];
+				old_slots[pos] = new_gen_prefix | val;
+				if (pos > i && pos < old_cap && (uint16) (displaced >> 48) == gen)
+				{
+					val = displaced & UINT64CONST(0x0000ffffffffffff);
+					continue;
+				}
+				break;
+			}
+		}
+
+		fv->mask = new_mask;
+		fv->grow_at = HNSW_VISITED_GROW_AT(new_cap);
+		fv->gen = next_gen;
+		return;
+	}
 
 	if (fv->is_backend_cache && new_cap <= HNSW_BACKEND_VISITED_MAX_CAP)
 		ctx = TopMemoryContext;
@@ -1120,7 +1202,7 @@ hnsw_fast_visited_grow(HnswFastVisited *fv, uint32 extra)
 
 	fv->slots = new_slots;
 	fv->mask = new_mask;
-	fv->grow_at = (new_cap * 3) / 4;
+	fv->grow_at = HNSW_VISITED_GROW_AT(new_cap);
 	fv->gen = gen;
 
 	if (fv->is_backend_cache)
@@ -1144,7 +1226,53 @@ hnsw_fast_visited_init(HnswFastVisited *fv, int ef, int m,
 	uint32		min_cap = (uint32) Max((Size) ef * m * 4, (Size) 128);
 	uint32		desired = hnsw_next_pow2_u32(min_cap);
 
-	if (fv->slots != NULL)
+	if (fv->is_backend_cache && hnsw_backend_visited.slots != NULL)
+	{
+		if (desired <= hnsw_backend_visited.cap)
+		{
+			uint16		next_gen;
+
+			if (unlikely(hnsw_backend_visited.gen >= 0xfff0U))
+			{
+				memset(hnsw_backend_visited.slots, 0,
+					   (Size) hnsw_backend_visited.cap * sizeof(uint64));
+				next_gen = 1;
+			}
+			else
+				next_gen = (uint16) (hnsw_backend_visited.gen + 1U);
+
+			hnsw_backend_visited.gen = next_gen;
+			fv->slots = hnsw_backend_visited.slots;
+			fv->mask = desired - 1;
+			fv->grow_at = HNSW_VISITED_GROW_AT(desired);
+			fv->gen = next_gen;
+			fv->count = 0;
+			fv->on_stack = false;
+			return;
+		}
+		if (desired <= HNSW_BACKEND_VISITED_MAX_CAP)
+		{
+			uint64	   *new_slots = (uint64 *) MemoryContextAllocZero(TopMemoryContext,
+																	(Size) desired * sizeof(uint64));
+			uint64	   *old_slots = hnsw_backend_visited.slots;
+
+			hnsw_backend_visited.slots = new_slots;
+			hnsw_backend_visited.cap = desired;
+			hnsw_backend_visited.gen = 1;
+			fv->slots = new_slots;
+			fv->mask = desired - 1;
+			fv->grow_at = HNSW_VISITED_GROW_AT(desired);
+			fv->gen = 1;
+			fv->count = 0;
+			fv->on_stack = false;
+			pfree(old_slots);
+			return;
+		}
+		fv->is_backend_cache = false;
+		hnsw_backend_visited.in_use = false;
+		fv->slots = NULL;
+	}
+	else if (fv->slots != NULL)
 	{
 		uint32		cur_cap = fv->mask + 1;
 
@@ -1157,35 +1285,10 @@ hnsw_fast_visited_init(HnswFastVisited *fv, int ef, int m,
 				fv->gen = 1;
 			}
 			fv->count = 0;
-			if (fv->is_backend_cache)
-				hnsw_backend_visited.gen = fv->gen;
 			return;
 		}
 
-		if (fv->is_backend_cache)
-		{
-			if (desired <= HNSW_BACKEND_VISITED_MAX_CAP)
-			{
-				uint64	   *new_slots = (uint64 *) MemoryContextAllocZero(TopMemoryContext,
-																		(Size) desired * sizeof(uint64));
-				uint64	   *old_slots = fv->slots;
-
-				hnsw_backend_visited.slots = new_slots;
-				hnsw_backend_visited.cap = desired;
-				hnsw_backend_visited.gen = 1;
-				fv->slots = new_slots;
-				fv->mask = desired - 1;
-				fv->grow_at = (desired * 3) / 4;
-				fv->gen = 1;
-				fv->count = 0;
-				fv->on_stack = false;
-				pfree(old_slots);
-				return;
-			}
-			fv->is_backend_cache = false;
-			hnsw_backend_visited.in_use = false;
-		}
-		else if (!fv->on_stack)
+		if (!fv->on_stack)
 			pfree(fv->slots);
 
 		fv->slots = NULL;
@@ -1196,7 +1299,7 @@ hnsw_fast_visited_init(HnswFastVisited *fv, int ef, int m,
 		memset(stack_buf, 0, (Size) desired * sizeof(uint64));
 		fv->slots = stack_buf;
 		fv->mask = desired - 1;
-		fv->grow_at = (desired * 3) / 4;
+		fv->grow_at = HNSW_VISITED_GROW_AT(desired);
 		fv->gen = 1;
 		fv->count = 0;
 		fv->on_stack = true;
@@ -1218,7 +1321,7 @@ hnsw_fast_visited_init(HnswFastVisited *fv, int ef, int m,
 			hnsw_backend_visited.gen = 1;
 			fv->slots = new_slots;
 			fv->mask = desired - 1;
-			fv->grow_at = (desired * 3) / 4;
+			fv->grow_at = HNSW_VISITED_GROW_AT(desired);
 			fv->gen = 1;
 			fv->count = 0;
 			fv->on_stack = false;
@@ -1234,7 +1337,7 @@ hnsw_fast_visited_init(HnswFastVisited *fv, int ef, int m,
 		fv->alloc_ctx = ctx;
 		fv->slots = (uint64 *) MemoryContextAllocZero(ctx, (Size) desired * sizeof(uint64));
 		fv->mask = desired - 1;
-		fv->grow_at = (desired * 3) / 4;
+		fv->grow_at = HNSW_VISITED_GROW_AT(desired);
 		fv->gen = 1;
 		fv->count = 0;
 		fv->on_stack = false;
@@ -1749,6 +1852,147 @@ HnswSteppedPrefetchAdvance(int i, int count, const HnswUnvisited *unvisited,
 		int			idx1 = i + HNSW_PREFETCH_STEP_STAGEC;
 
 		HnswPrefetchTupleStageC(etups[idx1], limits[idx1]);
+	}
+}
+
+typedef struct HnswPipeCand
+{
+	CalicoTranslationEntry *entry_ptr;
+	uint64		opt_ver;
+	uint32		id;
+	BlockNumber page;
+	OffsetNumber off;
+	uint8		level;
+	int8		stage;
+	int16		at_i;
+	uint32		buf_id;
+}			HnswPipeCand;
+
+#define HNSW_ITUP_PREF_L1 0
+#define HNSW_ITUP_PREF_L2 1
+#define HNSW_ITUP_PREF_HDR 2
+
+static pg_attribute_always_inline HnswElementTuple
+HnswResolveIterativeTuple(const char *buf_blocks, const CalicoOptimisticSlot *slot,
+						  OffsetNumber offno, Size tuple_bytes,
+						  Size min_valid_bytes, int pref_mode)
+{
+	Page		page;
+	ItemIdData	item;
+	unsigned	offset;
+	unsigned	length;
+	const char *p;
+	Size		limit;
+	uintptr_t	cl;
+	uintptr_t	last_cl;
+
+	if (unlikely(!slot->opt_valid || slot->entry_ptr == NULL))
+		return NULL;
+	if (unlikely(offno < FirstOffsetNumber ||
+				 offno > (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
+		return NULL;
+
+	page = CalicoFramePageBase(buf_blocks, slot->frame_id);
+	item = *(volatile ItemIdData *) PageGetItemId(page, offno);
+	if (unlikely(!ItemIdIsNormal(&item)))
+		return NULL;
+
+	offset = ItemIdGetOffset(&item);
+	length = ItemIdGetLength(&item);
+	if (unlikely(offset < SizeOfPageHeaderData ||
+				 length < sizeof(HnswElementTupleData) ||
+				 length < min_valid_bytes ||
+				 offset + length > BLCKSZ))
+		return NULL;
+
+	limit = Min(tuple_bytes, (Size) length);
+	if (unlikely(limit == 0))
+		return NULL;
+
+	p = (const char *) page + offset;
+	cl = (uintptr_t) p & ~(uintptr_t) 63;
+
+	if (pref_mode == HNSW_ITUP_PREF_L1)
+	{
+		last_cl = (uintptr_t) (p + limit - 1) & ~(uintptr_t) 63;
+		for (; cl <= last_cl; cl += 64)
+			__builtin_prefetch((const void *) cl, 0, 3);
+	}
+	else if (pref_mode == HNSW_ITUP_PREF_L2)
+	{
+		last_cl = (uintptr_t) (p + limit - 1) & ~(uintptr_t) 63;
+		for (; cl <= last_cl; cl += 64)
+			__builtin_prefetch((const void *) cl, 0, 2);
+	}
+	else
+	{
+		Size		hdr_bytes = Min(limit, (Size) 192);
+		uintptr_t	end_addr = (uintptr_t) (p + limit - 1);
+
+		last_cl = (uintptr_t) (p + hdr_bytes - 1) & ~(uintptr_t) 63;
+		for (; cl <= last_cl; cl += 64)
+			__builtin_prefetch((const void *) cl, 0, 3);
+		if (unlikely((((uintptr_t) p ^ end_addr) & ~(uintptr_t) 4095) != 0))
+			__builtin_prefetch((const void *) (end_addr & ~(uintptr_t) 4095), 0, 2);
+	}
+
+	return (HnswElementTuple) p;
+}
+
+static pg_attribute_always_inline void
+HnswAdvancePipeCand(HnswPipeCand *pc, int i, int m, int lm,
+					const char *buf_blocks, CalicoReadHandle *read_handle)
+{
+	if (pc->stage == 1 && (i - pc->at_i) >= 2)
+	{
+		uint64		opt_ver;
+		void	   *entry_ptr;
+
+		if (likely(calico_optimistic_lookup_handle_frame(read_handle, pc->page,
+														 &opt_ver, &pc->buf_id, &entry_ptr)) &&
+			likely(pc->off >= FirstOffsetNumber &&
+				   pc->off <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
+		{
+			__builtin_prefetch(PageGetItemId(CalicoFramePageBase(buf_blocks, pc->buf_id), pc->off), 0, 3);
+			pc->entry_ptr = (CalicoTranslationEntry *) entry_ptr;
+			pc->opt_ver = opt_ver;
+			pc->stage = 2;
+			pc->at_i = (int16) i;
+		}
+		else
+			pc->stage = -1;
+	}
+	else if (pc->stage == 2 && (i - pc->at_i) >= 2)
+	{
+		HnswPrefetchNextNeighborTuple(buf_blocks, pc->buf_id, pc->off, pc->level, m, lm);
+		pc->stage = 3;
+	}
+}
+
+static pg_attribute_always_inline void
+HnswFinishPipeCand(HnswPipeCand *pc, int count, int m, int lm,
+				   const char *buf_blocks, CalicoReadHandle *read_handle)
+{
+	if (pc->stage == 2)
+	{
+		HnswPrefetchNextNeighborTuple(buf_blocks, pc->buf_id, pc->off, pc->level, m, lm);
+		pc->stage = 3;
+	}
+	else if (pc->stage == 1 && (count - pc->at_i) >= 2)
+	{
+		uint64		opt_ver;
+		void	   *entry_ptr;
+
+		if (likely(calico_optimistic_lookup_handle_frame(read_handle, pc->page,
+														 &opt_ver, &pc->buf_id, &entry_ptr)) &&
+			likely(pc->off >= FirstOffsetNumber &&
+				   pc->off <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
+		{
+			__builtin_prefetch(PageGetItemId(CalicoFramePageBase(buf_blocks, pc->buf_id), pc->off), 0, 3);
+			pc->entry_ptr = (CalicoTranslationEntry *) entry_ptr;
+			pc->opt_ver = opt_ver;
+			pc->stage = 2;
+		}
 	}
 }
 
@@ -2624,17 +2868,16 @@ HnswLoadFastCandSlow(BlockNumber blkno, OffsetNumber offno,
 }
 
 /*
- * Compact 8-byte key queues and chunked 24-byte node arena live in the scan
+ * Compact 8-byte key queues and chunked 20-byte node arena live in the scan
  * temporary context and retain discarded candidates across iterative batches.
  * Heap TIDs are copied during the validated vector read so returning rows
  * never rereads index tuples or allocates per-candidate search objects.
  */
 StaticAssertDecl(sizeof(HnswIterativeKey) == 8, "HnswIterativeKey must be 8 bytes");
-StaticAssertDecl(sizeof(HnswIterativeNode) == 24, "HnswIterativeNode must be 24 bytes");
+StaticAssertDecl(sizeof(HnswIterativeNode) == 20, "HnswIterativeNode must be 20 bytes");
 
 static pg_attribute_always_inline HnswIterativeKey
 HnswIterativeRememberRaw(HnswIterativeState *state,
-						 BlockNumber blkno, OffsetNumber offno,
 						 BlockNumber neighborPage, OffsetNumber neighborOffno,
 						 uint8 level, uint8 version,
 						 const ItemPointerData *htids, uint8 n_htids,
@@ -2660,8 +2903,6 @@ HnswIterativeRememberRaw(HnswIterativeState *state,
 	}
 
 	node = &state->chunks[chunk_idx][id & HNSW_ITER_CHUNK_MASK];
-	node->blkno = blkno;
-	node->offno = offno;
 	node->neighborPage = neighborPage;
 	node->neighborOffno = neighborOffno;
 	node->level = level;
@@ -2706,10 +2947,9 @@ HnswIterativeRememberRaw(HnswIterativeState *state,
 }
 
 static inline HnswIterativeKey
-HnswIterativeRememberElement(HnswIterativeState *state, HnswElement el,
-							 BlockNumber block, OffsetNumber offset, double distance)
+HnswIterativeRememberElement(HnswIterativeState *state, HnswElement el, double distance)
 {
-	return HnswIterativeRememberRaw(state, block, offset,
+	return HnswIterativeRememberRaw(state,
 									el->neighborPage, el->neighborOffno,
 									el->level, el->version,
 									el->heaptids, (uint8) el->heaptidsLength,
@@ -2725,7 +2965,7 @@ HnswIterativePushMin4(HnswIterativeKey key, HnswIterativeKey **heap,
 
 	if (unlikely(*count == *capacity))
 	{
-		Size		new_capacity = (Size) (*capacity) * 2;
+		Size		new_capacity = (*capacity >= 256) ? (Size) (*capacity) * 4 : (Size) (*capacity) * 2;
 
 		*heap = (HnswIterativeKey *) repalloc(*heap, mul_size(sizeof(HnswIterativeKey), new_capacity));
 		*capacity = (int) new_capacity;
@@ -2788,8 +3028,14 @@ HnswIterativeSiftDownMin4(HnswIterativeKey *heap, int count, int pos)
 
 		if (!__builtin_isgreater(key.distance, best_d))
 			break;
-		if ((best << 2) + 1 < count)
-			__builtin_prefetch(&heap[(best << 2) + 1], 0, 3);
+		if (count > 5 && best <= (count - 6) >> 4)
+		{
+			int			gc = (best << 4) + 5;
+
+			__builtin_prefetch(&heap[gc], 0, 3);
+			if (gc + 8 < count)
+				__builtin_prefetch(&heap[gc + 8], 0, 3);
+		}
 		heap[pos] = heap[best];
 		pos = best;
 	}
@@ -2799,12 +3045,100 @@ HnswIterativeSiftDownMin4(HnswIterativeKey *heap, int count, int pos)
 static inline HnswIterativeKey
 HnswIterativePop(HnswIterativeState *state)
 {
-	HnswIterativeKey key = state->pending[0];
+	if (unlikely(state->pending_sorted))
+		return state->pending[--state->pending_count];
+	{
+		HnswIterativeKey key = state->pending[0];
 
-	state->pending[0] = state->pending[--state->pending_count];
-	if (state->pending_count > 0)
-		HnswIterativeSiftDownMin4(state->pending, state->pending_count, 0);
-	return key;
+		state->pending[0] = state->pending[--state->pending_count];
+		if (state->pending_count > 0)
+			HnswIterativeSiftDownMin4(state->pending, state->pending_count, 0);
+		return key;
+	}
+}
+
+static pg_attribute_always_inline uint32
+HnswFloatDescRadixKey(float d)
+{
+	uint32		u;
+
+	memcpy(&u, &d, sizeof(uint32));
+	if (unlikely((u & 0x7fffffffU) > 0x7f800000U))
+		return 0U;
+	return ((int32) u < 0) ? u : (u ^ 0x7fffffffU);
+}
+
+static pg_noinline void
+HnswSortPendingDesc(HnswIterativeState *state)
+{
+	const int	n = state->pending_count;
+	uint32		hist[4][256];
+	HnswIterativeKey *tmp;
+	HnswIterativeKey *src;
+	HnswIterativeKey *dst;
+
+	if (n <= 1)
+	{
+		state->pending_sorted = true;
+		return;
+	}
+
+	memset(hist, 0, sizeof(hist));
+	src = state->pending;
+	for (int i = 0; i < n; i++)
+	{
+		uint32		k = HnswFloatDescRadixKey(src[i].distance);
+
+		hist[0][k & 0xffU]++;
+		hist[1][(k >> 8) & 0xffU]++;
+		hist[2][(k >> 16) & 0xffU]++;
+		hist[3][k >> 24]++;
+	}
+
+	tmp = (HnswIterativeKey *) palloc(mul_size(sizeof(HnswIterativeKey), (Size) n));
+	dst = tmp;
+
+	for (int pass = 0; pass < 4; pass++)
+	{
+		uint32	   *h = hist[pass];
+		uint32		sum = 0;
+		bool		trivial = false;
+		const int	shift = pass * 8;
+
+		for (int b = 0; b < 256; b++)
+		{
+			uint32		c = h[b];
+
+			if (c == (uint32) n)
+			{
+				trivial = true;
+				break;
+			}
+			h[b] = sum;
+			sum += c;
+		}
+		if (trivial)
+			continue;
+
+		for (int i = 0; i < n; i++)
+		{
+			uint32		k = HnswFloatDescRadixKey(src[i].distance);
+			uint32		b = (k >> shift) & 0xffU;
+
+			dst[h[b]++] = src[i];
+		}
+		{
+			HnswIterativeKey *swap = src;
+
+			src = dst;
+			dst = swap;
+		}
+	}
+
+	if (src != state->pending)
+		memcpy(state->pending, src, mul_size(sizeof(HnswIterativeKey), (Size) n));
+	pfree(tmp);
+	state->pending_sorted = true;
 }
 
 static inline void
@@ -2901,9 +3235,10 @@ HnswIterativeCommit(HnswIterativeState *state, HnswIterativeKey key,
 }
 
 static pg_attribute_always_inline bool
-HnswLoadIterativeKeyOptimisticSlotImpl(HnswSupport *support, BlockNumber blkno, OffsetNumber offno,
+HnswLoadIterativeKeyOptimisticSlotImpl(HnswSupport *support, OffsetNumber offno,
 									   const CalicoOptimisticSlot *slot,
 									   HnswElementTuple cached_etup,
+									   const float *pref_bx,
 									   const char *buf_blocks,
 									   const Vector *a_vec, Size vec_size,
 									   double *dist_out, HnswIterativeState *state,
@@ -2942,7 +3277,9 @@ HnswLoadIterativeKeyOptimisticSlotImpl(HnswSupport *support, BlockNumber blkno, 
 
 	if (likely(a_vec != NULL))
 	{
-		if (unlikely(!HnswGetDistanceOptimisticImpl(support, a_vec, &etup->data, vec_size, use_avx_fma, &dist)))
+		if (unlikely(!HnswGetDistanceOptimisticPrefetchImpl(support, a_vec, &etup->data,
+														   vec_size, use_avx_fma, pref_bx,
+														   &dist)))
 			return false;
 	}
 	else
@@ -2967,7 +3304,7 @@ HnswLoadIterativeKeyOptimisticSlotImpl(HnswSupport *support, BlockNumber blkno, 
 	if (dist_out != NULL)
 		dist = *dist_out;
 
-	*key_out = HnswIterativeRememberRaw(state, blkno, offno,
+	*key_out = HnswIterativeRememberRaw(state,
 										ItemPointerGetBlockNumber(&nb),
 										ItemPointerGetOffsetNumber(&nb),
 										level, version, htids, n_ht, dist);
@@ -2976,22 +3313,22 @@ HnswLoadIterativeKeyOptimisticSlotImpl(HnswSupport *support, BlockNumber blkno, 
 
 #if !defined(VECTOR_NATIVE_AVX_FMA) && defined(USE_DISPATCH)
 static pg_noinline VECTOR_TARGET_AVX_FMA bool
-HnswLoadIterativeKeyOptimisticSlotAvxFma(HnswSupport *support, BlockNumber blkno, OffsetNumber offno,
+HnswLoadIterativeKeyOptimisticSlotAvxFma(HnswSupport *support, OffsetNumber offno,
 										 const CalicoOptimisticSlot *slot,
 										 const char *buf_blocks,
 										 const Vector *a_vec, Size vec_size,
 										 HnswIterativeState *state,
 										 HnswIterativeKey *key_out)
 {
-	return HnswLoadIterativeKeyOptimisticSlotImpl(support, blkno, offno, slot,
-												  NULL, buf_blocks,
+	return HnswLoadIterativeKeyOptimisticSlotImpl(support, offno, slot,
+												  NULL, NULL, buf_blocks,
 												  a_vec, vec_size, NULL, state,
 												  true, key_out);
 }
 #endif
 
 static pg_attribute_always_inline bool
-HnswLoadIterativeKeyOptimisticSlotFast(HnswSupport *support, BlockNumber blkno, OffsetNumber offno,
+HnswLoadIterativeKeyOptimisticSlotFast(HnswSupport *support, OffsetNumber offno,
 									   const CalicoOptimisticSlot *slot,
 									   const char *buf_blocks,
 									   const Vector *a_vec, Size vec_size,
@@ -3000,12 +3337,12 @@ HnswLoadIterativeKeyOptimisticSlotFast(HnswSupport *support, BlockNumber blkno, 
 {
 #if !defined(VECTOR_NATIVE_AVX_FMA) && defined(USE_DISPATCH)
 	if (likely(a_vec != NULL && vector_has_avx_fma))
-		return HnswLoadIterativeKeyOptimisticSlotAvxFma(support, blkno, offno, slot,
+		return HnswLoadIterativeKeyOptimisticSlotAvxFma(support, offno, slot,
 														buf_blocks, a_vec, vec_size,
 														state, key_out);
 #endif
-	return HnswLoadIterativeKeyOptimisticSlotImpl(support, blkno, offno, slot,
-												  NULL, buf_blocks,
+	return HnswLoadIterativeKeyOptimisticSlotImpl(support, offno, slot,
+												  NULL, NULL, buf_blocks,
 												  a_vec, vec_size, NULL, state,
 												  false, key_out);
 }
@@ -3071,19 +3408,19 @@ HnswScoreIterativeResidentBody(HnswQuery *q, int ef, int m, int lm,
 							   HnswIterativeState *state,
 							   const HnswUnvisited *unvisited, int count,
 							   const CalicoOptimisticSlot *slots,
-							   HnswElementTuple *cand_etups, uint16 *cand_limits,
+							   HnswElementTuple *cand_etups,
 							   bool optimistic,
 							   const Vector *query, Size vec_size,
 							   Size prefetch, Size minimum,
 							   const char *buf_blocks,
 							   bool doStepPrefetch, bool doPipe,
-							   uint32 p0_id, BlockNumber p0_page,
-							   OffsetNumber p0_off, uint8 p0_level,
-							   int p0_stage, int p0_at_i, uint32 p0_buf_id,
+							   HnswPipeCand *pipe,
 							   int *candidate_count, int *result_count,
 							   bool force_avx_fma)
 {
 	CalicoReadHandle *const read_handle = optimistic ? &support->read_handle : NULL;
+	HnswPipeCand p0 = pipe[0];
+	HnswPipeCand p1 = pipe[1];
 
 	for (int i = 0; i < count; i++)
 	{
@@ -3091,41 +3428,41 @@ HnswScoreIterativeResidentBody(HnswQuery *q, int ef, int m, int lm,
 		BlockNumber block = ItemPointerGetBlockNumber(&unvisited[i].indextid);
 		OffsetNumber offset = ItemPointerGetOffsetNumber(&unvisited[i].indextid);
 		HnswElementTuple cached_etup;
+		const float *pref_bx = NULL;
 
 		if (doStepPrefetch)
-			HnswSteppedPrefetchAdvance(i, count, unvisited, slots, cand_etups, cand_limits,
-									   prefetch, minimum, buf_blocks);
+		{
+			if (i + 8 < count && likely(slots[i + 8].opt_valid))
+			{
+				OffsetNumber off8 = ItemPointerGetOffsetNumber(&unvisited[i + 8].indextid);
+
+				if (likely(off8 >= FirstOffsetNumber &&
+						   off8 <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
+				{
+					Page		page8 = CalicoFramePageBase(buf_blocks, slots[i + 8].frame_id);
+
+					__builtin_prefetch(PageGetItemId(page8, off8), 0, 3);
+				}
+			}
+			if (i + 4 < count)
+				cand_etups[i + 4] = HnswResolveIterativeTuple(buf_blocks, &slots[i + 4],
+															  ItemPointerGetOffsetNumber(&unvisited[i + 4].indextid),
+															  prefetch, minimum,
+															  HNSW_ITUP_PREF_HDR);
+			if (likely(query != NULL) && i + 2 < count && likely(cand_etups[i + 2] != NULL))
+				pref_bx = cand_etups[i + 2]->data.x;
+		}
 
 		if (doPipe)
 		{
-			if (p0_stage == 1 && (i - p0_at_i) >= 3)
-			{
-				uint64		opt_ver;
-				void	   *entry_ptr;
-
-				if (likely(calico_optimistic_lookup_handle_frame(read_handle, p0_page,
-																 &opt_ver, &p0_buf_id, &entry_ptr)) &&
-					likely(p0_off >= FirstOffsetNumber &&
-						   p0_off <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
-				{
-					__builtin_prefetch(PageGetItemId(CalicoFramePageBase(buf_blocks, p0_buf_id), p0_off), 0, 3);
-					p0_stage = 2;
-					p0_at_i = i;
-				}
-				else
-					p0_stage = -1;
-			}
-			else if (p0_stage == 2 && (i - p0_at_i) >= 4)
-			{
-				HnswPrefetchNextNeighborTuple(buf_blocks, p0_buf_id, p0_off, p0_level, m, lm);
-				p0_stage = 3;
-			}
+			HnswAdvancePipeCand(&p0, i, m, lm, buf_blocks, read_handle);
+			HnswAdvancePipeCand(&p1, i, m, lm, buf_blocks, read_handle);
 		}
 
 		cached_etup = (cand_etups != NULL) ? cand_etups[i] : NULL;
 		if (!optimistic ||
-			!HnswLoadIterativeKeyOptimisticSlotImpl(support, block, offset, &slots[i],
-													cached_etup, buf_blocks,
+			!HnswLoadIterativeKeyOptimisticSlotImpl(support, offset, &slots[i],
+													cached_etup, pref_bx, buf_blocks,
 													query, vec_size, NULL, state,
 													force_avx_fma, &next))
 		{
@@ -3135,40 +3472,45 @@ HnswScoreIterativeResidentBody(HnswQuery *q, int ef, int m, int lm,
 
 			HnswLoadElementImpl(block, offset, &distance, q, index, support,
 								false, NULL, &element);
-			next = HnswIterativeRememberElement(state, element, block, offset, distance);
+			next = HnswIterativeRememberElement(state, element, distance);
 		}
 
 		if (HnswIterativeCommit(state, next, ef, candidate_count, result_count) &&
-			doPipe && state->candidates[0].id != p0_id)
+			doPipe && state->candidates[0].id != p0.id)
 		{
-			const HnswIterativeNode *p0_node;
+			uint32		new_id = state->candidates[0].id;
 
-			p0_id = state->candidates[0].id;
-			p0_node = HnswIterativeGetNode(state, p0_id);
-			p0_page = p0_node->neighborPage;
-			p0_off = p0_node->neighborOffno;
-			p0_level = p0_node->level;
-			calico_optimistic_prefetch_block(read_handle, p0_page);
-			p0_stage = 1;
-			p0_at_i = i;
+			if (new_id == p1.id)
+			{
+				HnswPipeCand tmp = p0;
+
+				p0 = p1;
+				p1 = tmp;
+			}
+			else
+			{
+				const HnswIterativeNode *p0_node;
+
+				p1 = p0;
+				p0.id = new_id;
+				p0_node = HnswIterativeGetNode(state, new_id);
+				__builtin_prefetch(p0_node, 0, 3);
+				p0.page = p0_node->neighborPage;
+				p0.off = p0_node->neighborOffno;
+				p0.level = p0_node->level;
+				calico_optimistic_prefetch_block(read_handle, p0.page);
+				p0.stage = 1;
+				p0.at_i = (int16) i;
+			}
 		}
 	}
 
 	if (doPipe)
 	{
-		if (p0_stage == 2)
-			HnswPrefetchNextNeighborTuple(buf_blocks, p0_buf_id, p0_off, p0_level, m, lm);
-		else if (p0_stage == 1 && (count - p0_at_i) >= 2)
-		{
-			uint64		opt_ver;
-			void	   *entry_ptr;
-
-			if (likely(calico_optimistic_lookup_handle_frame(read_handle, p0_page,
-															 &opt_ver, &p0_buf_id, &entry_ptr)) &&
-				likely(p0_off >= FirstOffsetNumber &&
-					   p0_off <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
-				__builtin_prefetch(PageGetItemId(CalicoFramePageBase(buf_blocks, p0_buf_id), p0_off), 0, 3);
-		}
+		HnswFinishPipeCand(&p0, count, m, lm, buf_blocks, read_handle);
+		HnswFinishPipeCand(&p1, count, m, lm, buf_blocks, read_handle);
+		pipe[0] = p0;
+		pipe[1] = p1;
 	}
 }
 
@@ -3179,23 +3521,19 @@ HnswScoreIterativeResidentAvxFma(HnswQuery *q, int ef, int m, int lm,
 								 HnswIterativeState *state,
 								 const HnswUnvisited *unvisited, int count,
 								 const CalicoOptimisticSlot *slots,
-								 HnswElementTuple *cand_etups, uint16 *cand_limits,
+								 HnswElementTuple *cand_etups,
 								 const Vector *query, Size vec_size,
 								 Size prefetch, Size minimum,
 								 const char *buf_blocks,
 								 bool doStepPrefetch, bool doPipe,
-								 uint32 p0_id, BlockNumber p0_page,
-								 OffsetNumber p0_off, uint8 p0_level,
-								 int p0_stage, int p0_at_i, uint32 p0_buf_id,
+								 HnswPipeCand *pipe,
 								 int *candidate_count, int *result_count)
 {
 	HnswScoreIterativeResidentBody(q, ef, m, lm, index, support, state,
-								   unvisited, count, slots, cand_etups, cand_limits,
+								   unvisited, count, slots, cand_etups,
 								   true, query, vec_size, prefetch, minimum,
 								   buf_blocks, doStepPrefetch, doPipe,
-								   p0_id, p0_page, p0_off, p0_level,
-								   p0_stage, p0_at_i, p0_buf_id,
-								   candidate_count, result_count, true);
+								   pipe, candidate_count, result_count, true);
 }
 #endif
 
@@ -3246,7 +3584,6 @@ HnswScoreIterativeAsyncWave(HnswQuery *q, int ef, Relation index,
 		for (int r = 0; r < n_res; r++)
 		{
 			int			idx = res_idxs[r];
-			BlockNumber block = ItemPointerGetBlockNumber(&unvisited[idx].indextid);
 			OffsetNumber offset = ItemPointerGetOffsetNumber(&unvisited[idx].indextid);
 			HnswIterativeKey next;
 
@@ -3259,7 +3596,7 @@ HnswScoreIterativeAsyncWave(HnswQuery *q, int ef, Relation index,
 									  prefetch);
 			}
 
-			if (HnswLoadIterativeKeyOptimisticSlotFast(support, block, offset, &slots[idx],
+			if (HnswLoadIterativeKeyOptimisticSlotFast(support, offset, &slots[idx],
 													   buf_blocks, query, vec_size,
 													   state, &next))
 			{
@@ -3328,7 +3665,7 @@ HnswScoreIterativeAsyncWave(HnswQuery *q, int ef, Relation index,
 			}
 
 			if (!optimistic ||
-				!HnswLoadIterativeKeyOptimisticSlotFast(support, block, offset, &slots[idx],
+				!HnswLoadIterativeKeyOptimisticSlotFast(support, offset, &slots[idx],
 														buf_blocks, query, vec_size,
 														state, &next))
 			{
@@ -3338,7 +3675,7 @@ HnswScoreIterativeAsyncWave(HnswQuery *q, int ef, Relation index,
 
 				HnswLoadElementImpl(block, offset, &distance, q, index, support,
 									false, NULL, &element);
-				next = HnswIterativeRememberElement(state, element, block, offset, distance);
+				next = HnswIterativeRememberElement(state, element, distance);
 			}
 			HnswIterativeCommit(state, next, ef, candidate_count, result_count);
 		}
@@ -3534,6 +3871,77 @@ HnswExpandIterativeOomWave(HnswQuery *q, int ef, Relation index,
 		state->oom_hit_streak = 0;
 }
 
+static pg_attribute_always_inline bool
+HnswPrimeIterativeUnvisited(Relation index, HnswSupport *support,
+							const HnswUnvisited *unvisited, int count,
+							const BlockNumber *batch_blocknums,
+							const uint16 *linp_offs,
+							bool useBatchOpt,
+							CalicoOptimisticSlot *slots_out,
+							HnswElementTuple *cand_etups,
+							Size prefetch, Size minimum,
+							const char *buf_blocks,
+							CalicoAsyncBatch **batch_out_ptr)
+{
+	if (likely(useBatchOpt))
+	{
+		bool		all_resident;
+
+		all_resident = calico_optimistic_lookup_batch_slots_noprefetch(&support->read_handle,
+																		batch_blocknums,
+																		count,
+																		slots_out);
+		if (unlikely(!all_resident))
+		{
+			if (cand_etups != NULL)
+				memset(cand_etups, 0, sizeof(HnswElementTuple) * count);
+			if (HnswLoadUnvisitedMissingOrPinSlow(index, support, batch_blocknums,
+												  count, unvisited, slots_out,
+												  prefetch, batch_out_ptr))
+				return true;
+		}
+		else if (likely(prefetch > 0 && cand_etups != NULL))
+		{
+			int			linp_prime = Min(count, 8);
+
+			for (int j = 0; j < linp_prime; j++)
+			{
+				if (likely(slots_out[j].resident && linp_offs[j] != 0))
+					__builtin_prefetch((const char *) CalicoFramePageBase(buf_blocks, slots_out[j].frame_id) + linp_offs[j], 0, 3);
+			}
+			cand_etups[0] = HnswResolveIterativeTuple(buf_blocks, &slots_out[0],
+													  ItemPointerGetOffsetNumber(&unvisited[0].indextid),
+													  prefetch, minimum, HNSW_ITUP_PREF_L1);
+			if (count > 1)
+				cand_etups[1] = HnswResolveIterativeTuple(buf_blocks, &slots_out[1],
+														  ItemPointerGetOffsetNumber(&unvisited[1].indextid),
+														  prefetch, minimum, HNSW_ITUP_PREF_L2);
+			for (int j = 2; j < Min(count, 4); j++)
+				cand_etups[j] = HnswResolveIterativeTuple(buf_blocks, &slots_out[j],
+														  ItemPointerGetOffsetNumber(&unvisited[j].indextid),
+														  prefetch, minimum, HNSW_ITUP_PREF_HDR);
+			for (int j = 4; j < count; j++)
+				cand_etups[j] = NULL;
+		}
+		else if (cand_etups != NULL)
+		{
+			memset(cand_etups, 0, sizeof(HnswElementTuple) * count);
+		}
+	}
+	else
+	{
+		for (int j = 0; j < count; j++)
+		{
+			slots_out[j].resident = false;
+			slots_out[j].opt_valid = false;
+		}
+		if (cand_etups != NULL)
+			memset(cand_etups, 0, sizeof(HnswElementTuple) * count);
+	}
+
+	return false;
+}
+
 static void
 HnswSearchIterativeCore(HnswQuery *q, int ef, Relation index,
 						HnswSupport *support, int m, visited_hash *v,
@@ -3545,15 +3953,17 @@ HnswSearchIterativeCore(HnswQuery *q, int ef, Relation index,
 	int			result_count = 0;
 	int			lm = HnswGetLayerM(m, 0);
 	HnswUnvisited unvisited[HNSW_MAX_M * 2];
+	BlockNumber batch_blocknums[HNSW_MAX_M * 2];
+	uint16		linp_offs[HNSW_MAX_M * 2];
 	CalicoOptimisticSlot slots[HNSW_MAX_M * 2];
 	HnswElementTuple cand_etups[HNSW_MAX_M * 2];
-	uint16		cand_limits[HNSW_MAX_M * 2];
 	CalicoAsyncBatch *batch = NULL;
 	Size		minimum = offsetof(HnswElementTupleData, data) + vec_size;
 	const char *const buf_blocks = BufferBlocks;
 	const bool	doPrefetch = hnsw_enable_prefetch;
-	const bool	doStepPrefetch = (doPrefetch && optimistic && prefetch > 0);
-	const bool	doPipe = (doPrefetch && optimistic);
+	const bool	useBatchOpt = (optimistic && doPrefetch);
+	const bool	doStepPrefetch = (useBatchOpt && prefetch > 0);
+	const bool	doPipe = useBatchOpt;
 
 	Assert(ef > 0 && lm <= lengthof(unvisited));
 
@@ -3566,14 +3976,44 @@ HnswSearchIterativeCore(HnswQuery *q, int ef, Relation index,
 
 	if (!expand)
 	{
-		int			drain = Min(ef, state->pending_count);
+		int			drain;
 
-		for (int i = 0; i < drain; i++)
-			state->results[result_count++] = HnswIterativePop(state);
+		if (!state->pending_sorted)
+		{
+			if (state->drain_batches >= 1 && state->pending_count > 4096)
+				HnswSortPendingDesc(state);
+			else if (state->drain_batches < 255)
+				state->drain_batches++;
+		}
+
+		drain = Min(ef, state->pending_count);
+		if (state->pending_sorted)
+		{
+			for (int i = 0; i < drain; i++)
+				state->results[result_count++] = state->pending[--state->pending_count];
+		}
+		else
+		{
+			for (int i = 0; i < drain; i++)
+				state->results[result_count++] = HnswIterativePop(state);
+		}
 		state->result_count = result_count;
 		state->result_idx = 0;
 		state->cur_rem_htids = 0;
 		return;
+	}
+
+	state->drain_batches = 0;
+	if (unlikely(state->pending_sorted))
+	{
+		for (int l = 0, r = state->pending_count - 1; l < r; l++, r--)
+		{
+			HnswIterativeKey swap = state->pending[l];
+
+			state->pending[l] = state->pending[r];
+			state->pending[r] = swap;
+		}
+		state->pending_sorted = false;
 	}
 
 	for (int i = 0; i < ef && state->pending_count > 0; i++)
@@ -3585,104 +4025,277 @@ HnswSearchIterativeCore(HnswQuery *q, int ef, Relation index,
 		HnswIterativePushMax4(key, state->results, &result_count);
 	}
 
-	while (candidate_count > 0)
 	{
-		HnswIterativeKey cand;
-		const HnswIterativeNode *cnode;
-		int			count;
-		bool		asynchronous;
-		uint32		p0_id = UINT32_MAX;
-		BlockNumber p0_page = InvalidBlockNumber;
-		OffsetNumber p0_off = InvalidOffsetNumber;
-		uint8		p0_level = 0;
-		int			p0_stage = 0;
-		int			p0_at_i = -2;
-		uint32		p0_buf_id = 0;
-		uint64		nb_fb_before;
+		HnswPipeCand pipe[2];
 
-		CHECK_FOR_INTERRUPTS();
-		if (state->candidates[0].distance > state->results[0].distance)
-			break;
-		if (unlikely(state->oom_mode))
+		pipe[0].entry_ptr = NULL;
+		pipe[0].opt_ver = 0;
+		pipe[0].id = UINT32_MAX;
+		pipe[0].page = InvalidBlockNumber;
+		pipe[0].off = InvalidOffsetNumber;
+		pipe[0].level = 0;
+		pipe[0].stage = 0;
+		pipe[0].at_i = -2;
+		pipe[0].buf_id = 0;
+		pipe[1] = pipe[0];
+
+		while (candidate_count > 0)
 		{
-			HnswExpandIterativeOomWave(q, ef, index, support, m, lm, v, tuples,
-									   state, optimistic, query, vec_size, prefetch,
-									   buf_blocks, &batch,
-									   &candidate_count, &result_count);
-			continue;
-		}
+			int			count = 0;
+			bool		asynchronous;
+			uint64		nb_fb_before;
 
-		cand = state->candidates[0];
-		cnode = HnswIterativeGetNode(state, cand.id);
-		state->candidates[0] = state->candidates[--candidate_count];
-		if (candidate_count > 0)
-			HnswIterativeSiftDownMin4(state->candidates, candidate_count, 0);
-
-		if (doPipe && candidate_count > 0 &&
-			(result_count == 0 || state->candidates[0].distance <= state->results[0].distance))
-		{
-			const HnswIterativeNode *p0_node;
-
-			p0_id = state->candidates[0].id;
-			p0_node = HnswIterativeGetNode(state, p0_id);
-			p0_page = p0_node->neighborPage;
-			p0_off = p0_node->neighborOffno;
-			p0_level = p0_node->level;
-			calico_optimistic_prefetch_block(&support->read_handle, p0_page);
-			p0_stage = 1;
-		}
-
-		nb_fb_before = calico_optimistic_neighbor_fallbacks;
-		HnswLoadUnvisitedRaw(cnode->neighborPage, cnode->neighborOffno,
-							 cnode->level, cnode->version, unvisited, &count, v,
-							 index, support, m, lm, 0, slots, prefetch, minimum,
-							 optimistic ? cand_etups : NULL,
-							 optimistic ? cand_limits : NULL,
-							 &batch);
-		(*tuples) += count;
-		asynchronous = batch != NULL && batch->active;
-		if (unlikely(asynchronous || calico_optimistic_neighbor_fallbacks != nb_fb_before))
-		{
-			state->oom_mode = true;
-			state->oom_hit_streak = 0;
-		}
-
-		if (likely(!asynchronous))
-		{
-#if !defined(VECTOR_NATIVE_AVX_FMA) && defined(USE_DISPATCH)
-			if (likely(optimistic && query != NULL && vector_has_avx_fma))
+			CHECK_FOR_INTERRUPTS();
+			if (state->candidates[0].distance > state->results[0].distance)
+				break;
+			if (unlikely(state->oom_mode))
 			{
-				HnswScoreIterativeResidentAvxFma(q, ef, m, lm, index, support, state,
-												 unvisited, count, slots,
-												 cand_etups, cand_limits,
-												 query, vec_size, prefetch, minimum,
-												 buf_blocks, doStepPrefetch, doPipe,
-												 p0_id, p0_page, p0_off, p0_level,
-												 p0_stage, p0_at_i, p0_buf_id,
-												 &candidate_count, &result_count);
+				pipe[0].id = UINT32_MAX;
+				pipe[0].stage = 0;
+				pipe[0].entry_ptr = NULL;
+				pipe[1] = pipe[0];
+				HnswExpandIterativeOomWave(q, ef, index, support, m, lm, v, tuples,
+										   state, optimistic, query, vec_size, prefetch,
+										   buf_blocks, &batch,
+										   &candidate_count, &result_count);
+				continue;
+			}
+
+			if (unlikely(batch != NULL))
+			{
+				batch->active = false;
+				batch->num_ranges = 0;
+			}
+
+			nb_fb_before = calico_optimistic_neighbor_fallbacks;
+			{
+				int			n_popped = 0;
+
+				while (candidate_count > 0)
+				{
+					HnswIterativeKey pop_key = state->candidates[0];
+					const HnswIterativeNode *pop_node;
+					int			u_cnt = 0;
+					CalicoOptimisticSlot pre_slot_buf;
+					const CalicoOptimisticSlot *pre_slot = NULL;
+
+					if (n_popped > 0)
+					{
+						if (count > 0 &&
+							(n_popped >= 2 || ef < 32 || count >= 8 ||
+							 calico_optimistic_neighbor_fallbacks != nb_fb_before))
+							break;
+						if (count + lm > (int) lengthof(unvisited))
+							break;
+						if (result_count == ef && pop_key.distance > state->results[0].distance)
+							break;
+					}
+
+					if (count == 0 && n_popped > 0)
+						CHECK_FOR_INTERRUPTS();
+
+					if (doPipe)
+					{
+						const HnswPipeCand *hit = NULL;
+
+						if (pop_key.id == pipe[0].id && pipe[0].stage >= 2)
+							hit = &pipe[0];
+						else if (pop_key.id == pipe[1].id && pipe[1].stage >= 2)
+							hit = &pipe[1];
+
+						if (hit != NULL && likely(hit->entry_ptr != NULL))
+						{
+							pre_slot_buf.entry_ptr = hit->entry_ptr;
+							pre_slot_buf.version = hit->opt_ver;
+							pre_slot_buf.frame_id = hit->buf_id;
+							pre_slot_buf.resident = true;
+							pre_slot_buf.opt_valid = true;
+							pre_slot = &pre_slot_buf;
+						}
+					}
+
+					state->candidates[0] = state->candidates[--candidate_count];
+					if (candidate_count > 0)
+						HnswIterativeSiftDownMin4(state->candidates, candidate_count, 0);
+					pop_node = HnswIterativeGetNode(state, pop_key.id);
+					if (HnswCollectUnvisitedFromNeighbor(pop_node->neighborPage,
+														 pop_node->neighborOffno,
+														 pop_node->level,
+														 pop_node->version,
+														 pre_slot,
+														 &unvisited[count], &u_cnt,
+														 v, index, support, m, lm, 0,
+														 useBatchOpt,
+														 &batch_blocknums[count],
+														 &linp_offs[count]))
+					{
+						(*tuples) += u_cnt;
+						count += u_cnt;
+					}
+					n_popped++;
+				}
+			}
+
+			if (unlikely(count == 0))
+			{
+				if (unlikely(calico_optimistic_neighbor_fallbacks != nb_fb_before))
+				{
+					state->oom_mode = true;
+					state->oom_hit_streak = 0;
+				}
+				continue;
+			}
+
+			{
+				HnswPipeCand prev_p0 = pipe[0];
+				HnswPipeCand prev_p1 = pipe[1];
+
+				pipe[0].entry_ptr = NULL;
+				pipe[0].opt_ver = 0;
+				pipe[0].id = UINT32_MAX;
+				pipe[0].page = InvalidBlockNumber;
+				pipe[0].off = InvalidOffsetNumber;
+				pipe[0].level = 0;
+				pipe[0].stage = 0;
+				pipe[0].at_i = -2;
+				pipe[0].buf_id = 0;
+				pipe[1] = pipe[0];
+
+				if (doPipe && candidate_count > 0)
+				{
+					if (result_count < ef ||
+						state->candidates[0].distance <= state->results[0].distance)
+					{
+						uint32		c0_id = state->candidates[0].id;
+
+						if (c0_id == prev_p0.id && prev_p0.stage >= 2)
+						{
+							pipe[0] = prev_p0;
+							pipe[0].at_i = -2;
+						}
+						else if (c0_id == prev_p1.id && prev_p1.stage >= 2)
+						{
+							pipe[0] = prev_p1;
+							pipe[0].at_i = -2;
+						}
+						else
+						{
+							const HnswIterativeNode *p0_node = HnswIterativeGetNode(state, c0_id);
+
+							pipe[0].id = c0_id;
+							__builtin_prefetch(p0_node, 0, 3);
+							pipe[0].page = p0_node->neighborPage;
+							pipe[0].off = p0_node->neighborOffno;
+							pipe[0].level = p0_node->level;
+							calico_optimistic_prefetch_block(&support->read_handle, pipe[0].page);
+							pipe[0].stage = 1;
+							pipe[0].at_i = -2;
+						}
+
+						if (ef >= 32 && candidate_count > 1)
+						{
+							int			best_h = 1;
+							float		best_d = state->candidates[1].distance;
+							int			chk_end = Min(candidate_count, 5);
+
+							for (int h = 2; h < chk_end; h++)
+							{
+								float		d = state->candidates[h].distance;
+
+								if (d < best_d)
+								{
+									best_d = d;
+									best_h = h;
+								}
+							}
+							if (result_count < ef || best_d <= state->results[0].distance)
+							{
+								uint32		c1_id = state->candidates[best_h].id;
+
+								if (c1_id == prev_p0.id && prev_p0.stage >= 2)
+								{
+									pipe[1] = prev_p0;
+									pipe[1].at_i = -1;
+								}
+								else if (c1_id == prev_p1.id && prev_p1.stage >= 2)
+								{
+									pipe[1] = prev_p1;
+									pipe[1].at_i = -1;
+								}
+								else
+								{
+									const HnswIterativeNode *p1_node = HnswIterativeGetNode(state, c1_id);
+
+									pipe[1].id = c1_id;
+									__builtin_prefetch(p1_node, 0, 3);
+									pipe[1].page = p1_node->neighborPage;
+									pipe[1].off = p1_node->neighborOffno;
+									pipe[1].level = p1_node->level;
+									calico_optimistic_prefetch_block(&support->read_handle, pipe[1].page);
+									pipe[1].stage = 1;
+									pipe[1].at_i = -1;
+								}
+							}
+						}
+					}
+					for (int h = 1; h < Min(candidate_count, 5); h++)
+					{
+						uint32		hn_id = state->candidates[h].id;
+
+						if (hn_id != pipe[1].id)
+						{
+							const HnswIterativeNode *hn = HnswIterativeGetNode(state, hn_id);
+
+							__builtin_prefetch(hn, 0, 2);
+							calico_optimistic_prefetch_block(&support->read_handle, hn->neighborPage);
+						}
+					}
+				}
+			}
+
+			asynchronous = HnswPrimeIterativeUnvisited(index, support, unvisited, count,
+													   batch_blocknums, linp_offs,
+													   useBatchOpt, slots,
+													   useBatchOpt ? cand_etups : NULL,
+													   prefetch, minimum, buf_blocks, &batch);
+			if (unlikely(asynchronous || calico_optimistic_neighbor_fallbacks != nb_fb_before))
+			{
+				state->oom_mode = true;
+				state->oom_hit_streak = 0;
+			}
+
+			if (likely(!asynchronous))
+			{
+#if !defined(VECTOR_NATIVE_AVX_FMA) && defined(USE_DISPATCH)
+				if (likely(optimistic && query != NULL && vector_has_avx_fma))
+				{
+					HnswScoreIterativeResidentAvxFma(q, ef, m, lm, index, support, state,
+													 unvisited, count, slots,
+													 useBatchOpt ? cand_etups : NULL,
+													 query, vec_size, prefetch, minimum,
+													 buf_blocks, doStepPrefetch, doPipe,
+													 pipe, &candidate_count, &result_count);
+				}
+				else
+#endif
+				{
+					HnswScoreIterativeResidentBody(q, ef, m, lm, index, support, state,
+												   unvisited, count, slots,
+												   useBatchOpt ? cand_etups : NULL,
+												   optimistic,
+												   query, vec_size, prefetch, minimum,
+												   buf_blocks, doStepPrefetch, doPipe,
+												   pipe, &candidate_count, &result_count, false);
+				}
 			}
 			else
-#endif
 			{
-				HnswScoreIterativeResidentBody(q, ef, m, lm, index, support, state,
-											   unvisited, count, slots,
-											   optimistic ? cand_etups : NULL,
-											   optimistic ? cand_limits : NULL,
-											   optimistic,
-											   query, vec_size, prefetch, minimum,
-											   buf_blocks, doStepPrefetch, doPipe,
-											   p0_id, p0_page, p0_off, p0_level,
-											   p0_stage, p0_at_i, p0_buf_id,
-											   &candidate_count, &result_count, false);
+				HnswScoreIterativeAsyncWave(q, ef, index, support, state,
+											unvisited, slots, count,
+											optimistic, query, vec_size, prefetch,
+											buf_blocks, batch,
+											&candidate_count, &result_count);
 			}
-		}
-		else
-		{
-			HnswScoreIterativeAsyncWave(q, ef, index, support, state,
-										unvisited, slots, count,
-										optimistic, query, vec_size, prefetch,
-										buf_blocks, batch,
-										&candidate_count, &result_count);
 		}
 	}
 
@@ -3767,8 +4380,8 @@ HnswSearchIterativeFromEntry(HnswQuery *q, HnswElement entryPoint, int ef,
 			ep_slot.resident = true;
 			ep_slot.opt_valid = true;
 
-			ep_loaded = HnswLoadIterativeKeyOptimisticSlotImpl(support, best.blkno, best.offno,
-															   &ep_slot, NULL, BufferBlocks,
+			ep_loaded = HnswLoadIterativeKeyOptimisticSlotImpl(support, best.offno,
+															   &ep_slot, NULL, NULL, BufferBlocks,
 															   NULL, 0,
 															   &best_dist, state, false, &ep_key);
 		}
@@ -3783,8 +4396,7 @@ HnswSearchIterativeFromEntry(HnswQuery *q, HnswElement entryPoint, int ef,
 
 		HnswLoadElementImpl(best.blkno, best.offno, NULL, q, index, support,
 							false, NULL, &ep_el);
-		ep_key = HnswIterativeRememberElement(state, ep_el, best.blkno, best.offno,
-											  best.distance);
+		ep_key = HnswIterativeRememberElement(state, ep_el, best.distance);
 	}
 
 	HnswIterativePushMin4(ep_key, &state->pending, &state->pending_count,

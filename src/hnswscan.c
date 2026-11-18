@@ -238,6 +238,8 @@ HnswPrefetchHeapSlotMeta(const char *buf_blocks,
 	if (!slot->resident)
 		return;
 
+	if (slot->entry_ptr != NULL)
+		__builtin_prefetch(slot->entry_ptr, 0, 3);
 	__builtin_prefetch(GetBufferDescriptor(slot->frame_id), 1, 3);
 	if (!slot->opt_valid)
 		return;
@@ -317,6 +319,17 @@ HnswPrefetchIterativeHeapWindow(IndexScanDesc scan, HnswScanOpaque so)
 	state->pref_start = idx;
 	state->pref_end = end;
 
+	for (int k = 0; k < cnt; k++)
+	{
+		const HnswIterativeNode *node;
+
+		if (k + 8 < cnt)
+			__builtin_prefetch(HnswIterativeGetNode(state, state->results[idx + k + 8].id), 0, 0);
+		node = HnswIterativeGetNode(state, state->results[idx + k].id);
+		state->pref_htid_meta[k] = node->htid_meta;
+		state->pref_first_htids[k] = node->first_htid;
+	}
+
 	if (!calico_enable_optimistic_reads || !hnsw_enable_prefetch ||
 		heapRel == NULL || RelationUsesLocalBuffers(heapRel) || !calico_is_active())
 	{
@@ -337,8 +350,8 @@ HnswPrefetchIterativeHeapWindow(IndexScanDesc scan, HnswScanOpaque so)
 
 	for (int k = 0; k < cnt; k++)
 	{
-		const HnswIterativeNode *node = HnswIterativeGetNode(state, state->results[idx + k].id);
-		uint8		n_ht = (uint8) (node->htid_meta >> 24);
+		uint32		htid_meta = state->pref_htid_meta[k];
+		uint8		n_ht = (uint8) (htid_meta >> 24);
 
 		state->pref_slots[k].resident = false;
 		state->pref_slots[k].opt_valid = false;
@@ -346,8 +359,8 @@ HnswPrefetchIterativeHeapWindow(IndexScanDesc scan, HnswScanOpaque so)
 		if (likely(n_ht > 0))
 		{
 			const ItemPointerData *tid = (n_ht == 1)
-				? &node->first_htid
-				: &state->extra_htids[(node->htid_meta & 0x00ffffffU) + n_ht - 2U];
+				? &state->pref_first_htids[k]
+				: &state->extra_htids[(htid_meta & 0x00ffffffU) + n_ht - 2U];
 
 			if (ItemPointerIsValid(tid))
 			{
@@ -687,8 +700,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		else if (so->iterative != NULL)
 		{
 			HnswIterativeState *state = so->iterative;
-			const HnswIterativeNode *node;
-			const HnswIterativeKey *key;
+			uint32		htid_meta;
 			bool		was_first = false;
 			int			wslot;
 
@@ -722,11 +734,12 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 				HnswPrefetchIterativeHeapWindow(scan, so);
 			}
 
-			key = &state->results[state->result_idx];
-			node = HnswIterativeGetNode(state, key->id);
+			wslot = state->result_idx - state->pref_start;
+			Assert(wslot >= 0 && state->result_idx < state->pref_end);
+			htid_meta = state->pref_htid_meta[wslot];
 			if (state->cur_rem_htids == 0)
 			{
-				uint8		n_htids = (uint8) (node->htid_meta >> 24);
+				uint8		n_htids = (uint8) (htid_meta >> 24);
 
 				if (n_htids == 0)
 				{
@@ -735,7 +748,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 				}
 				if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
 				{
-					double		dist = (double) key->distance;
+					double		dist = (double) state->results[state->result_idx].distance;
 
 					if (dist < so->previousDistance)
 					{
@@ -748,17 +761,16 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 				was_first = true;
 			}
 
-			wslot = state->result_idx - state->pref_start;
 			if (state->cur_rem_htids > 1)
 			{
-				uint32		extra_off = node->htid_meta & 0x00ffffffU;
+				uint32		extra_off = htid_meta & 0x00ffffffU;
 
 				heaptid = &state->extra_htids[extra_off + state->cur_rem_htids - 2U];
 				state->cur_rem_htids--;
 			}
 			else
 			{
-				heaptid = &node->first_htid;
+				heaptid = &state->pref_first_htids[wslot];
 				state->cur_rem_htids = 0;
 				state->result_idx++;
 			}

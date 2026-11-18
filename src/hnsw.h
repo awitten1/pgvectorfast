@@ -449,7 +449,7 @@ typedef union
 #define HNSW_ITER_CHUNK_SIZE (1U << HNSW_ITER_CHUNK_BITS)
 #define HNSW_ITER_CHUNK_MASK (HNSW_ITER_CHUNK_SIZE - 1U)
 #define HNSW_ITER_HEAP_PREFETCH_MAX 64
-#define HNSW_ITER_DRAIN_BATCH 64
+#define HNSW_ITER_DRAIN_BATCH 256
 #define HNSW_ITER_OOM_WAVE_MAX 4
 #define HNSW_ITER_OOM_UNVISITED_CAP 256
 
@@ -469,10 +469,8 @@ typedef struct HnswIterativeKey
 
 typedef struct HnswIterativeNode
 {
-	BlockNumber blkno;
 	BlockNumber neighborPage;
 	uint32		htid_meta;		/* (heap_count << 24) | extra_off */
-	OffsetNumber offno;
 	OffsetNumber neighborOffno;
 	ItemPointerData first_htid;
 	uint8		level;
@@ -495,6 +493,8 @@ typedef struct HnswIterativeState
 	uint8		cur_rem_htids;
 	bool		oom_mode;
 	uint8		oom_hit_streak;
+	bool		pending_sorted;
+	uint8		drain_batches;
 	HnswIterativeNode **chunks;
 	uint32		node_count;
 	uint32		chunk_count;
@@ -502,6 +502,8 @@ typedef struct HnswIterativeState
 	ItemPointerData *extra_htids;
 	uint32		extra_count;
 	uint32		extra_capacity;
+	uint32		pref_htid_meta[HNSW_ITER_HEAP_PREFETCH_MAX];
+	ItemPointerData pref_first_htids[HNSW_ITER_HEAP_PREFETCH_MAX];
 	OffsetNumber pref_offs[HNSW_ITER_HEAP_PREFETCH_MAX];
 	CalicoOptimisticSlot pref_slots[HNSW_ITER_HEAP_PREFETCH_MAX];
 }			HnswIterativeState;
