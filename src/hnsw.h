@@ -450,6 +450,8 @@ typedef union
 #define HNSW_ITER_CHUNK_MASK (HNSW_ITER_CHUNK_SIZE - 1U)
 #define HNSW_ITER_HEAP_PREFETCH_MAX 64
 #define HNSW_ITER_DRAIN_BATCH 64
+#define HNSW_ITER_OOM_WAVE_MAX 4
+#define HNSW_ITER_OOM_UNVISITED_CAP 256
 
 typedef struct HnswFastResultCand
 {
@@ -491,6 +493,8 @@ typedef struct HnswIterativeState
 	int			pref_start;
 	int			pref_end;
 	uint8		cur_rem_htids;
+	bool		oom_mode;
+	uint8		oom_hit_streak;
 	HnswIterativeNode **chunks;
 	uint32		node_count;
 	uint32		chunk_count;
@@ -535,8 +539,10 @@ typedef struct HnswScanOpaqueData
 	HnswSupport support;
 	CalicoReadHandle heap_handle;
 	bool		heap_handle_inited;
+	BlockNumber heap_nblocks;
 	uint8		heap_pref_count;
 	uint8		heap_pref_idx;
+	uint8		heap_io_window;
 	OffsetNumber heap_offs[HNSW_HEAP_PREFETCH_MAX];
 	CalicoOptimisticSlot heap_slots[HNSW_HEAP_PREFETCH_MAX];
 	HnswFastResultCand *fast_cands;

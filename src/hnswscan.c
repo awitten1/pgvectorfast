@@ -252,6 +252,46 @@ HnswPrefetchHeapSlotMeta(const char *buf_blocks,
 	}
 }
 
+static bool
+HnswReadMissingHeapBlocksAsync(Relation heapRel, HnswScanOpaque so,
+								 const BlockNumber *blks,
+								 const CalicoOptimisticSlot *slots, int n)
+{
+	BlockNumber missing[HNSW_ITER_HEAP_PREFETCH_MAX];
+	int			n_missing = 0;
+	bool		refreshed = false;
+
+	for (int j = 0; j < n; j++)
+	{
+		if (!slots[j].resident)
+		{
+			BlockNumber blk = blks[j];
+
+			if (so->heap_nblocks == InvalidBlockNumber)
+				so->heap_nblocks = RelationGetNumberOfBlocks(heapRel);
+			if (blk >= so->heap_nblocks && !refreshed)
+			{
+				so->heap_nblocks = RelationGetNumberOfBlocks(heapRel);
+				refreshed = true;
+			}
+			if (blk < so->heap_nblocks)
+				missing[n_missing++] = blk;
+		}
+	}
+
+	if (n_missing > 0)
+	{
+		CalicoReadBuffersAsync(RelationGetSmgr(heapRel),
+							   heapRel->rd_rel->relpersistence,
+							   MAIN_FORKNUM,
+							   missing,
+							   n_missing);
+		return true;
+	}
+
+	return false;
+}
+
 static void
 HnswPrefetchIterativeHeapWindow(IndexScanDesc scan, HnswScanOpaque so)
 {
@@ -263,13 +303,16 @@ HnswPrefetchIterativeHeapWindow(IndexScanDesc scan, HnswScanOpaque so)
 	int			idx;
 	int			end;
 	int			cnt;
+	int			max_win;
 	int			n = 0;
+	bool		all_resident;
 
 	if (state == NULL || state->result_idx >= state->result_count)
 		return;
 
 	idx = state->result_idx;
-	end = Min(state->result_count, idx + HNSW_ITER_HEAP_PREFETCH_MAX);
+	max_win = (so->heap_io_window > 0) ? (int) so->heap_io_window : HNSW_ITER_HEAP_PREFETCH_MAX;
+	end = Min(state->result_count, idx + max_win);
 	cnt = end - idx;
 	state->pref_start = idx;
 	state->pref_end = end;
@@ -322,7 +365,25 @@ HnswPrefetchIterativeHeapWindow(IndexScanDesc scan, HnswScanOpaque so)
 	if (n <= 0)
 		return;
 
-	calico_optimistic_lookup_batch_slots_noprefetch(&so->heap_handle, blks, n, tmp_slots);
+	all_resident = calico_optimistic_lookup_batch_slots_noprefetch(&so->heap_handle, blks, n, tmp_slots);
+	if (unlikely(!all_resident))
+	{
+		if (so->heap_io_window == 0)
+		{
+			so->heap_io_window = 8;
+			if (cnt > 8)
+			{
+				cnt = 8;
+				state->pref_end = idx + cnt;
+				while (n > 0 && map_idx[n - 1] >= cnt)
+					n--;
+			}
+		}
+		if (HnswReadMissingHeapBlocksAsync(heapRel, so, blks, tmp_slots, n))
+			calico_optimistic_lookup_batch_slots_noprefetch(&so->heap_handle, blks, n, tmp_slots);
+		so->heap_io_window = (uint8) Min((int) so->heap_io_window * 2,
+										   HNSW_ITER_HEAP_PREFETCH_MAX);
+	}
 	for (int j = 0; j < n; j++)
 		state->pref_slots[map_idx[j]] = tmp_slots[j];
 
@@ -422,7 +483,16 @@ HnswPrefetchHeapResults(IndexScanDesc scan, HnswScanOpaque so)
 	if (n <= 0)
 		return;
 
-	calico_optimistic_lookup_batch_slots_noprefetch(&so->heap_handle, blks, n, so->heap_slots);
+	{
+		bool		all_resident;
+
+		all_resident = calico_optimistic_lookup_batch_slots_noprefetch(&so->heap_handle,
+																	   blks, n, so->heap_slots);
+		if (unlikely(!all_resident) &&
+			HnswReadMissingHeapBlocksAsync(heapRel, so, blks, so->heap_slots, n))
+			calico_optimistic_lookup_batch_slots_noprefetch(&so->heap_handle,
+															blks, n, so->heap_slots);
+	}
 	so->heap_pref_count = (uint8) n;
 	so->heap_pref_idx = 0;
 	{
@@ -451,6 +521,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 
 	so = (HnswScanOpaque) palloc(sizeof(HnswScanOpaqueData));
 	memset(so, 0, offsetof(HnswScanOpaqueData, fast_inline));
+	so->heap_nblocks = InvalidBlockNumber;
 	so->typeInfo = HnswGetTypeInfo(index);
 
 	/* Set support functions */
@@ -486,8 +557,10 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 
 	so->first = true;
+	so->heap_nblocks = InvalidBlockNumber;
 	so->heap_pref_count = 0;
 	so->heap_pref_idx = 0;
+	so->heap_io_window = 0;
 	so->fast_cands = NULL;
 	so->fast_count = 0;
 	so->fast_idx = 0;
