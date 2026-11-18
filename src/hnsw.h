@@ -445,6 +445,11 @@ typedef union
 }			HnswUnvisited;
 
 #define HNSW_HEAP_PREFETCH_MAX 12
+#define HNSW_ITER_CHUNK_BITS 10
+#define HNSW_ITER_CHUNK_SIZE (1U << HNSW_ITER_CHUNK_BITS)
+#define HNSW_ITER_CHUNK_MASK (HNSW_ITER_CHUNK_SIZE - 1U)
+#define HNSW_ITER_HEAP_PREFETCH_MAX 64
+#define HNSW_ITER_DRAIN_BATCH 64
 
 typedef struct HnswFastResultCand
 {
@@ -454,7 +459,60 @@ typedef struct HnswFastResultCand
 	uint16		_pad;
 }			HnswFastResultCand;
 
-typedef struct HnswIterativeState HnswIterativeState;
+typedef struct HnswIterativeKey
+{
+	float		distance;
+	uint32		id;
+}			HnswIterativeKey;
+
+typedef struct HnswIterativeNode
+{
+	BlockNumber blkno;
+	BlockNumber neighborPage;
+	uint32		htid_meta;		/* (heap_count << 24) | extra_off */
+	OffsetNumber offno;
+	OffsetNumber neighborOffno;
+	ItemPointerData first_htid;
+	uint8		level;
+	uint8		version;
+}			HnswIterativeNode;
+
+typedef struct HnswIterativeState
+{
+	HnswIterativeKey *pending;
+	HnswIterativeKey *candidates;
+	HnswIterativeKey *results;
+	int			pending_count;
+	int			pending_capacity;
+	int			candidate_capacity;
+	int			result_count;
+	int			result_capacity;
+	int			result_idx;
+	int			pref_start;
+	int			pref_end;
+	uint8		cur_rem_htids;
+	HnswIterativeNode **chunks;
+	uint32		node_count;
+	uint32		chunk_count;
+	uint32		chunk_capacity;
+	ItemPointerData *extra_htids;
+	uint32		extra_count;
+	uint32		extra_capacity;
+	OffsetNumber pref_offs[HNSW_ITER_HEAP_PREFETCH_MAX];
+	CalicoOptimisticSlot pref_slots[HNSW_ITER_HEAP_PREFETCH_MAX];
+}			HnswIterativeState;
+
+static inline const HnswIterativeNode *
+HnswIterativeGetNode(const HnswIterativeState *state, uint32 id)
+{
+	return &state->chunks[id >> HNSW_ITER_CHUNK_BITS][id & HNSW_ITER_CHUNK_MASK];
+}
+
+static inline bool
+HnswIterativeEmpty(const HnswIterativeState *state)
+{
+	return state->pending_count == 0;
+}
 
 typedef struct HnswScanOpaqueData
 {
@@ -524,8 +582,8 @@ int			HnswGetM(Relation index);
 int			HnswGetEfConstruction(Relation index);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
-bool HnswIterativeEmpty(HnswIterativeState *state);
-List *HnswSearchIterative(HnswQuery *q, List *ep, int ef, Relation index, HnswSupport *support, int m, visited_hash *v, int64 *tuples, HnswIterativeState **state, bool expand);
+void		HnswSearchIterativeFromEntry(HnswQuery * q, HnswElement entryPoint, int ef, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswIterativeState **state_ptr);
+void		HnswSearchIterativeBatch(HnswQuery * q, int ef, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswIterativeState *state, bool expand);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
 bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
