@@ -754,7 +754,7 @@ VectorL2SquaredDistanceDefault(int dim, const float *ax, const float *bx)
 TARGET_AVX_FMA static float
 VectorL2SquaredDistanceAvxFma(int dim, const float *ax, const float *bx)
 {
-	VECTOR_L2_SQUARED_AVX_FMA_IMPL(dim, ax, bx);
+	return VectorL2SquaredDistanceAvxFmaInline(dim, ax, bx);
 }
 
 static float
@@ -782,7 +782,7 @@ VectorInnerProductDefault(int dim, const float *ax, const float *bx)
 TARGET_AVX_FMA static float
 VectorInnerProductAvxFma(int dim, const float *ax, const float *bx)
 {
-	VECTOR_INNER_PRODUCT_AVX_FMA_IMPL(dim, ax, bx);
+	return VectorInnerProductAvxFmaInline(dim, ax, bx);
 }
 
 static double
@@ -811,6 +811,7 @@ VectorCosineSimilarityAvxFma(int dim, const float *ax, const float *bx)
 float		(*VectorL2SquaredDistancePtr) (int dim, const float *ax, const float *bx) = VectorL2SquaredDistanceDefault;
 float		(*VectorInnerProductPtr) (int dim, const float *ax, const float *bx) = VectorInnerProductDefault;
 double		(*VectorCosineSimilarityPtr) (int dim, const float *ax, const float *bx) = VectorCosineSimilarityDefault;
+bool		vector_has_avx_fma = false;
 
 TARGET_VECTOR_XSAVE static bool
 VectorSupportsAvxFma(void)
@@ -841,12 +842,14 @@ VectorInit(void)
 	VectorL2SquaredDistancePtr = VectorL2SquaredDistanceDefault;
 	VectorInnerProductPtr = VectorInnerProductDefault;
 	VectorCosineSimilarityPtr = VectorCosineSimilarityDefault;
+	vector_has_avx_fma = false;
 
 	if (VectorSupportsAvxFma())
 	{
 		VectorL2SquaredDistancePtr = VectorL2SquaredDistanceAvxFma;
 		VectorInnerProductPtr = VectorInnerProductAvxFma;
 		VectorCosineSimilarityPtr = VectorCosineSimilarityAvxFma;
+		vector_has_avx_fma = true;
 	}
 #endif
 }

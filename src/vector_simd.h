@@ -16,6 +16,7 @@
 extern float (*VectorL2SquaredDistancePtr) (int dim, const float *ax, const float *bx);
 extern float (*VectorInnerProductPtr) (int dim, const float *ax, const float *bx);
 extern double (*VectorCosineSimilarityPtr) (int dim, const float *ax, const float *bx);
+extern bool vector_has_avx_fma;
 #endif
 
 extern void VectorInit(void);
@@ -143,6 +144,26 @@ extern void VectorInit(void);
 		} \
 		return (double) similarity / sqrt((double) norma * (double) normb); \
 	} while (0)
+
+#if !defined(VECTOR_NATIVE_AVX_FMA) && defined(USE_DISPATCH)
+#ifdef _MSC_VER
+#define VECTOR_TARGET_AVX_FMA
+#else
+#define VECTOR_TARGET_AVX_FMA __attribute__((target("avx,fma")))
+#endif
+
+VECTOR_TARGET_AVX_FMA static inline float
+VectorL2SquaredDistanceAvxFmaInline(int dim, const float *ax, const float *bx)
+{
+	VECTOR_L2_SQUARED_AVX_FMA_IMPL(dim, ax, bx);
+}
+
+VECTOR_TARGET_AVX_FMA static inline float
+VectorInnerProductAvxFmaInline(int dim, const float *ax, const float *bx)
+{
+	VECTOR_INNER_PRODUCT_AVX_FMA_IMPL(dim, ax, bx);
+}
+#endif
 
 static inline float
 VectorL2SquaredDistanceScalar(int dim, const float *ax, const float *bx)

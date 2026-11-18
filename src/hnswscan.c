@@ -177,12 +177,15 @@ ShowMemoryUsage(HnswScanOpaque so)
 #endif
 
 static inline void
-HnswPrefetchHeapTuplePayloadSlot(const CalicoOptimisticSlot *slot, OffsetNumber offno)
+HnswPrefetchHeapTuplePayloadSlot(const char *buf_blocks,
+								 const CalicoOptimisticSlot *slot,
+								 OffsetNumber offno)
 {
 	Page		hpage;
-	ItemId		lpp;
+	ItemIdData	item;
 	uint16		toff;
 	uint16		tlen;
+	const char *p;
 
 	if (!slot->opt_valid)
 		return;
@@ -190,26 +193,62 @@ HnswPrefetchHeapTuplePayloadSlot(const CalicoOptimisticSlot *slot, OffsetNumber 
 				 offno > (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
 		return;
 
-	hpage = CalicoFramePage(slot->frame_id);
-	lpp = PageGetItemId(hpage, offno);
-	if (!ItemIdIsNormal(lpp))
+	hpage = (Page) (buf_blocks + ((Size) slot->frame_id) * BLCKSZ);
+	item = *(volatile ItemIdData *) PageGetItemId(hpage, offno);
+	if (!ItemIdIsNormal(&item))
 		return;
 
-	toff = ItemIdGetOffset(lpp);
-	tlen = ItemIdGetLength(lpp);
+	toff = ItemIdGetOffset(&item);
+	tlen = ItemIdGetLength(&item);
 	if (unlikely(toff < SizeOfPageHeaderData || tlen == 0 || toff + tlen > BLCKSZ))
 		return;
 
+	p = (const char *) hpage + toff;
+	if (tlen <= 448)
 	{
-		const char *p = (const char *) hpage + toff;
-		Size		limit = Min((Size) tlen, (Size) 1024);
-		Size		off;
+		uintptr_t	cl = (uintptr_t) p & ~(uintptr_t) 63;
+		uintptr_t	last_cl = (uintptr_t) (p + tlen - 1) & ~(uintptr_t) 63;
 
-		for (off = 0; off < limit; off += 64)
-			__builtin_prefetch(p + off, 0, 3);
-		if (limit > 0 &&
-			((uintptr_t) (p + limit - 1) >> 6) != ((uintptr_t) (p + off - 64) >> 6))
-			__builtin_prefetch(p + limit - 1, 0, 3);
+		for (; cl <= last_cl; cl += 64)
+			__builtin_prefetch((const void *) cl, 0, 3);
+	}
+	else
+	{
+		uintptr_t	cl = (uintptr_t) p & ~(uintptr_t) 63;
+		uintptr_t	head_last_cl = (uintptr_t) (p + 192 - 1) & ~(uintptr_t) 63;
+		uintptr_t	tail_cl = (uintptr_t) (p + tlen - 256) & ~(uintptr_t) 63;
+		uintptr_t	tail_last_cl = (uintptr_t) (p + tlen - 1) & ~(uintptr_t) 63;
+
+		for (; cl <= head_last_cl; cl += 64)
+			__builtin_prefetch((const void *) cl, 0, 3);
+		if (tail_cl <= head_last_cl)
+			tail_cl = head_last_cl + 64;
+		for (; tail_cl <= tail_last_cl; tail_cl += 64)
+			__builtin_prefetch((const void *) tail_cl, 0, 3);
+	}
+}
+
+static inline void
+HnswPrefetchHeapSlotMeta(const char *buf_blocks,
+						 const CalicoOptimisticSlot *slot,
+						 OffsetNumber offno)
+{
+	Page		hpage;
+
+	if (!slot->resident)
+		return;
+
+	__builtin_prefetch(GetBufferDescriptor(slot->frame_id), 1, 3);
+	if (!slot->opt_valid)
+		return;
+
+	hpage = (Page) (buf_blocks + ((Size) slot->frame_id) * BLCKSZ);
+	__builtin_prefetch(hpage, 0, 3);
+	if (likely(offno >= FirstOffsetNumber &&
+			   offno <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)) &&
+		offsetof(PageHeaderData, pd_linp) + (offno - 1) * sizeof(ItemIdData) >= 64)
+	{
+		__builtin_prefetch(PageGetItemId(hpage, offno), 0, 3);
 	}
 }
 
@@ -285,22 +324,18 @@ HnswPrefetchIterativeHeapWindow(IndexScanDesc scan, HnswScanOpaque so)
 
 	calico_optimistic_lookup_batch_slots_noprefetch(&so->heap_handle, blks, n, tmp_slots);
 	for (int j = 0; j < n; j++)
+		state->pref_slots[map_idx[j]] = tmp_slots[j];
+
 	{
-		int			k = map_idx[j];
+		const char *const buf_blocks = BufferBlocks;
+		int			meta_prime = Min(cnt, 4);
+		int			pay_prime = Min(cnt, 2);
 
-		state->pref_slots[k] = tmp_slots[j];
-		if (tmp_slots[j].opt_valid &&
-			likely(state->pref_offs[k] >= FirstOffsetNumber &&
-				   state->pref_offs[k] <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
-		{
-			Page		hpage = CalicoFramePage(tmp_slots[j].frame_id);
-
-			__builtin_prefetch(PageGetItemId(hpage, state->pref_offs[k]), 0, 3);
-		}
+		for (int k = 0; k < meta_prime; k++)
+			HnswPrefetchHeapSlotMeta(buf_blocks, &state->pref_slots[k], state->pref_offs[k]);
+		for (int k = 0; k < pay_prime; k++)
+			HnswPrefetchHeapTuplePayloadSlot(buf_blocks, &state->pref_slots[k], state->pref_offs[k]);
 	}
-
-	if (state->pref_slots[0].opt_valid)
-		HnswPrefetchHeapTuplePayloadSlot(&state->pref_slots[0], state->pref_offs[0]);
 }
 
 static void
@@ -390,16 +425,15 @@ HnswPrefetchHeapResults(IndexScanDesc scan, HnswScanOpaque so)
 	calico_optimistic_lookup_batch_slots_noprefetch(&so->heap_handle, blks, n, so->heap_slots);
 	so->heap_pref_count = (uint8) n;
 	so->heap_pref_idx = 0;
-	for (k = 0; k < n; k++)
 	{
-		if (so->heap_slots[k].opt_valid &&
-			likely(so->heap_offs[k] >= FirstOffsetNumber &&
-				   so->heap_offs[k] <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
-		{
-			Page		hpage = CalicoFramePage(so->heap_slots[k].frame_id);
+		const char *const buf_blocks = BufferBlocks;
+		int			meta_prime = Min(n, 4);
+		int			pay_prime = Min(n, 2);
 
-			__builtin_prefetch(PageGetItemId(hpage, so->heap_offs[k]), 0, 3);
-		}
+		for (k = 0; k < meta_prime; k++)
+			HnswPrefetchHeapSlotMeta(buf_blocks, &so->heap_slots[k], so->heap_offs[k]);
+		for (k = 0; k < pay_prime; k++)
+			HnswPrefetchHeapTuplePayloadSlot(buf_blocks, &so->heap_slots[k], so->heap_offs[k]);
 	}
 }
 
@@ -661,9 +695,20 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 			scan->xs_heaptid = *heaptid;
 			scan->xs_recheck = false;
 			scan->xs_recheckorderby = false;
-			if (was_first && wslot + 1 < (state->pref_end - state->pref_start))
-				HnswPrefetchHeapTuplePayloadSlot(&state->pref_slots[wslot + 1],
-												 state->pref_offs[wslot + 1]);
+			if (was_first)
+			{
+				int			wlen = state->pref_end - state->pref_start;
+				const char *const buf_blocks = BufferBlocks;
+
+				if (wslot + 4 < wlen)
+					HnswPrefetchHeapSlotMeta(buf_blocks,
+											 &state->pref_slots[wslot + 4],
+											 state->pref_offs[wslot + 4]);
+				if (wslot + 2 < wlen)
+					HnswPrefetchHeapTuplePayloadSlot(buf_blocks,
+													 &state->pref_slots[wslot + 2],
+													 state->pref_offs[wslot + 2]);
+			}
 			return true;
 		}
 		else
@@ -752,14 +797,12 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		if (so->heap_pref_idx < so->heap_pref_count)
 		{
 			uint8		cur = so->heap_pref_idx++;
+			const char *const buf_blocks = BufferBlocks;
 
-			if (cur > 0)
-			{
-				if (cur == 1)
-					HnswPrefetchHeapTuplePayloadSlot(&so->heap_slots[1], so->heap_offs[1]);
-				if (cur + 1 < so->heap_pref_count)
-					HnswPrefetchHeapTuplePayloadSlot(&so->heap_slots[cur + 1], so->heap_offs[cur + 1]);
-			}
+			if (cur + 4 < so->heap_pref_count)
+				HnswPrefetchHeapSlotMeta(buf_blocks, &so->heap_slots[cur + 4], so->heap_offs[cur + 4]);
+			if (cur + 2 < so->heap_pref_count)
+				HnswPrefetchHeapTuplePayloadSlot(buf_blocks, &so->heap_slots[cur + 2], so->heap_offs[cur + 2]);
 		}
 		return true;
 	}
