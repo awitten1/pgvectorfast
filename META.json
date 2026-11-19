@@ -2,7 +2,7 @@
 	"name": "pgvectorfast",
 	"abstract": "High-performance drop-in enhancement for pgvector with the Calico shared buffer pool",
 	"description": "pgvectorfast installs as a drop-in enhancement for pgvector on unmodified PostgreSQL 18 and 19 (Linux x86-64). It preserves SQL and on-disk compatibility for vector, halfvec, bit, and sparsevec types as well as HNSW and IVFFlat indexes, while adding the Calico array-based shared buffer pool, optimistic lock-free HNSW reads, and batched group prefetching.",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"maintainer": [
 		"Xinjing Zhou <zxjcarrot@gmail.com>"
 	],
@@ -21,13 +21,13 @@
 		"calico": {
 			"file": "sql/calico--0.2.sql",
 			"docfile": "README.md",
-			"version": "0.2.1",
+			"version": "0.2.2",
 			"abstract": "Calico array-based shared buffer pool extension for PostgreSQL"
 		},
 		"vectorfast": {
-			"file": "sql/vectorfast--0.2.1.sql",
+			"file": "sql/vectorfast--0.2.2.sql",
 			"docfile": "README.md",
-			"version": "0.2.1",
+			"version": "0.2.2",
 			"abstract": "Enable pgvector and the Calico buffer pool with one command"
 		}
 	},

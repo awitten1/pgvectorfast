@@ -56,6 +56,8 @@ $node->safe_psql('postgres', 'DROP EXTENSION calico;');
 $node->safe_psql('postgres', 'CREATE EXTENSION vectorfast;');
 is($node->safe_psql('postgres', 'SELECT calico.status();'), 'calico',
     'one command activates before returning');
+is($node->safe_psql('postgres', q{SELECT extversion FROM pg_extension WHERE extname = 'vectorfast'}),
+    '0.2.2', 'fresh installation uses the new version');
 is($node->safe_psql('postgres', q{
     SELECT string_agg(extname, ',' ORDER BY extname) FROM pg_extension
     WHERE extname IN ('vector', 'calico', 'vectorfast');
@@ -76,9 +78,15 @@ $node->safe_psql('postgres', q{
     GRANT SELECT, INSERT ON items TO vectorfast_user;
 });
 my $oid = $node->safe_psql('postgres', q{SELECT 'vector'::regtype::oid;});
-$node->safe_psql('postgres', 'CREATE EXTENSION vectorfast;');
+my $index_oid = $node->safe_psql('postgres', q{SELECT 'items_embedding_idx'::regclass::oid;});
+$node->safe_psql('postgres', q{CREATE EXTENSION vectorfast VERSION '0.2.1';});
+$node->safe_psql('postgres', 'ALTER EXTENSION vectorfast UPDATE;');
+is($node->safe_psql('postgres', q{SELECT extversion FROM pg_extension WHERE extname = 'vectorfast'}),
+    '0.2.2', 'version 0.2.1 upgrades to 0.2.2');
 is($node->safe_psql('postgres', q{SELECT 'vector'::regtype::oid;}), $oid,
     'existing vector type retained');
+is($node->safe_psql('postgres', q{SELECT 'items_embedding_idx'::regclass::oid;}), $index_oid,
+    'existing HNSW index retained');
 is($node->safe_psql('postgres', q{
     SET ROLE vectorfast_user;
     SELECT id FROM items ORDER BY embedding <-> '[1,2,3]' LIMIT 1;

@@ -1,3 +1,11 @@
+## pgvectorfast 0.2.2
+
+- Speed up iterative HNSW search with compact candidate queues, staged prefetching, and batched I/O when the index exceeds shared buffers.
+- Use optimistic reads for built-in inner-product distance, including HNSW cosine search on normalized vectors.
+- Fix visited-cache ownership for interleaved scans and honor `hnsw.enable_prefetch` when a cursor resumes.
+- Exercise filtered scans under concurrent writes, VACUUM, and buffer eviction.
+- Add matched-recall ArXiv benchmarks at 16 GiB and 2 GiB RAM.
+
 ## pgvectorfast 0.2.1
 
 - Enable pgvector and Calico with `CREATE EXTENSION vectorfast;`.
