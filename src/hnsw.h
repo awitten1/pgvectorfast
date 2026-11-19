@@ -2,6 +2,7 @@
 #define HNSW_H
 
 #include "postgres.h"
+#include "hnswvisited.h"
 #include "calico_internal.h"
 #include "storage/lwlock.h"
 #include "storage/spin.h"
@@ -303,12 +304,20 @@ typedef struct HnswTypeInfo
 	void		(*checkValue) (Pointer v);
 }			HnswTypeInfo;
 
+typedef enum HnswVectorDistance
+{
+	HNSW_VECTOR_DISTANCE_NONE,
+	HNSW_VECTOR_DISTANCE_L2,
+	HNSW_VECTOR_DISTANCE_INNER_PRODUCT
+} HnswVectorDistance;
+
 typedef struct HnswSupport
 {
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
 	CalicoReadHandle read_handle;
+	HnswVectorDistance vectorDistance;
 }			HnswSupport;
 
 typedef struct HnswQuery
@@ -402,27 +411,6 @@ typedef struct HnswNeighborTupleData
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
 
-typedef struct HnswFastVisited
-{
-	uint64	   *slots;
-	uint32		mask;			/* capacity - 1 (power of 2), 0 if uninitialized */
-	uint32		count;			/* entries inserted in current generation */
-	uint32		grow_at;		/* resize threshold */
-	MemoryContext alloc_ctx;	/* context owning heap slots */
-	uint16		gen;			/* active 16-bit generation tag (1..65535) */
-	bool		on_stack;		/* true if slots points to stack buffer */
-	bool		is_backend_cache;	/* true if slots points to backend cache */
-}			HnswFastVisited;
-
-static inline uint32
-hnsw_hash_tid48(uint64 tid48)
-{
-	uint64		h = tid48 ^ (tid48 >> 25);
-
-	h *= UINT64CONST(0xbf58476d1ce4e5b9);
-	return (uint32) (h ^ (h >> 31));
-}
-
 typedef union
 {
 	struct pointerhash_hash *pointers;
@@ -437,7 +425,6 @@ typedef union
 }			HnswUnvisited;
 
 #define HNSW_HEAP_PREFETCH_MAX 12
-
 typedef struct HnswFastResultCand
 {
 	double		distance;
@@ -446,15 +433,17 @@ typedef struct HnswFastResultCand
 	uint16		_pad;
 }			HnswFastResultCand;
 
+typedef struct HnswIterativeState HnswIterativeState;
+
 typedef struct HnswScanOpaqueData
 {
 	const		HnswTypeInfo *typeInfo;
 	bool		first;
 	List	   *w;
 	visited_hash v;
-	bool		visited_cb_registered;
 	MemoryContextCallback visited_cb;
 	pairingheap *discarded;
+	HnswIterativeState *iterative;
 	HnswQuery	q;
 	int			m;
 	int64		tuples;
@@ -466,8 +455,10 @@ typedef struct HnswScanOpaqueData
 	HnswSupport support;
 	CalicoReadHandle heap_handle;
 	bool		heap_handle_inited;
+	BlockNumber heap_nblocks;
 	uint8		heap_pref_count;
 	uint8		heap_pref_idx;
+	uint8		heap_io_window;
 	OffsetNumber heap_offs[HNSW_HEAP_PREFETCH_MAX];
 	CalicoOptimisticSlot heap_slots[HNSW_HEAP_PREFETCH_MAX];
 	HnswFastResultCand *fast_cands;
@@ -518,10 +509,6 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
-void		HnswAcquireScanVisited(HnswFastVisited *fv, MemoryContext scanCtx, MemoryContext tmpCtx, MemoryContextCallback *cb, bool *cbRegistered);
-void		HnswReleaseScanVisited(HnswFastVisited *fv);
-bool		HnswSearchLayerFastCands(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswFastResultCand *inline_buf, int inline_cap, HnswFastResultCand **fast_out, int *fast_count_out);
-bool		HnswSearchLayerFromEntryFastCands(char *base, HnswQuery * q, HnswElement entryPoint, int ef, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswFastResultCand *inline_buf, int inline_cap, HnswFastResultCand **fast_out, int *fast_count_out);
 void		HnswLoadFastWindow(Relation index, HnswSupport * support, const HnswFastResultCand *cands, int start_idx, int count, bool allow_deleted, ItemPointerData win_tids[][HNSW_HEAPTIDS], uint8 *win_len);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);

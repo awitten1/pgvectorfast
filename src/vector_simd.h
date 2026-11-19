@@ -16,11 +16,12 @@
 extern float (*VectorL2SquaredDistancePtr) (int dim, const float *ax, const float *bx);
 extern float (*VectorInnerProductPtr) (int dim, const float *ax, const float *bx);
 extern double (*VectorCosineSimilarityPtr) (int dim, const float *ax, const float *bx);
+extern bool vector_has_avx_fma;
 #endif
 
 extern void VectorInit(void);
 
-#define VECTOR_L2_SQUARED_AVX_FMA_IMPL(dim, ax, bx) \
+#define VECTOR_L2_SQUARED_AVX_FMA_CORE(dim, ax, bx, PREFETCH_STMT) \
 	do { \
 		int			i = 0; \
 		float		distance; \
@@ -40,6 +41,7 @@ extern void VectorInit(void);
 			sum1 = _mm256_fmadd_ps(d1, d1, sum1); \
 			sum2 = _mm256_fmadd_ps(d2, d2, sum2); \
 			sum3 = _mm256_fmadd_ps(d3, d3, sum3); \
+			PREFETCH_STMT; \
 		} \
 		for (; i + 8 <= (dim); i += 8) \
 		{ \
@@ -62,7 +64,17 @@ extern void VectorInit(void);
 		return distance; \
 	} while (0)
 
-#define VECTOR_INNER_PRODUCT_AVX_FMA_IMPL(dim, ax, bx) \
+#define VECTOR_L2_SQUARED_AVX_FMA_IMPL(dim, ax, bx) \
+	VECTOR_L2_SQUARED_AVX_FMA_CORE(dim, ax, bx, do {} while (0))
+
+#define VECTOR_L2_SQUARED_AVX_FMA_PREFETCH_IMPL(dim, ax, bx, pref_bx) \
+	VECTOR_L2_SQUARED_AVX_FMA_CORE(dim, ax, bx, \
+		do { \
+			__builtin_prefetch((pref_bx) + i + 15, 0, 3); \
+			__builtin_prefetch((pref_bx) + i + 31, 0, 3); \
+		} while (0))
+
+#define VECTOR_INNER_PRODUCT_AVX_FMA_CORE(dim, ax, bx, PREFETCH_STMT) \
 	do { \
 		int			i = 0; \
 		float		distance; \
@@ -78,6 +90,7 @@ extern void VectorInit(void);
 			sum1 = _mm256_fmadd_ps(_mm256_loadu_ps((ax) + i + 8), _mm256_loadu_ps((bx) + i + 8), sum1); \
 			sum2 = _mm256_fmadd_ps(_mm256_loadu_ps((ax) + i + 16), _mm256_loadu_ps((bx) + i + 16), sum2); \
 			sum3 = _mm256_fmadd_ps(_mm256_loadu_ps((ax) + i + 24), _mm256_loadu_ps((bx) + i + 24), sum3); \
+			PREFETCH_STMT; \
 		} \
 		for (; i + 8 <= (dim); i += 8) \
 			sum0 = _mm256_fmadd_ps(_mm256_loadu_ps((ax) + i), _mm256_loadu_ps((bx) + i), sum0); \
@@ -93,6 +106,16 @@ extern void VectorInit(void);
 			distance += (ax)[i] * (bx)[i]; \
 		return distance; \
 	} while (0)
+
+#define VECTOR_INNER_PRODUCT_AVX_FMA_IMPL(dim, ax, bx) \
+	VECTOR_INNER_PRODUCT_AVX_FMA_CORE(dim, ax, bx, do {} while (0))
+
+#define VECTOR_INNER_PRODUCT_AVX_FMA_PREFETCH_IMPL(dim, ax, bx, pref_bx) \
+	VECTOR_INNER_PRODUCT_AVX_FMA_CORE(dim, ax, bx, \
+		do { \
+			__builtin_prefetch((pref_bx) + i + 15, 0, 3); \
+			__builtin_prefetch((pref_bx) + i + 31, 0, 3); \
+		} while (0))
 
 #define VECTOR_COSINE_AVX_FMA_IMPL(dim, ax, bx) \
 	do { \
@@ -143,6 +166,50 @@ extern void VectorInit(void);
 		} \
 		return (double) similarity / sqrt((double) norma * (double) normb); \
 	} while (0)
+
+#if !defined(VECTOR_NATIVE_AVX_FMA) && defined(USE_DISPATCH)
+#ifdef _MSC_VER
+#define VECTOR_TARGET_AVX_FMA
+#else
+#define VECTOR_TARGET_AVX_FMA __attribute__((target("avx,fma")))
+#endif
+
+VECTOR_TARGET_AVX_FMA static inline float
+VectorL2SquaredDistanceAvxFmaInline(int dim, const float *ax, const float *bx)
+{
+	VECTOR_L2_SQUARED_AVX_FMA_IMPL(dim, ax, bx);
+}
+
+VECTOR_TARGET_AVX_FMA static inline float
+VectorInnerProductAvxFmaInline(int dim, const float *ax, const float *bx)
+{
+	VECTOR_INNER_PRODUCT_AVX_FMA_IMPL(dim, ax, bx);
+}
+
+VECTOR_TARGET_AVX_FMA static inline float
+VectorL2SquaredDistanceAvxFmaPrefetchInline(int dim, const float *ax, const float *bx, const float *pref_bx)
+{
+	VECTOR_L2_SQUARED_AVX_FMA_PREFETCH_IMPL(dim, ax, bx, pref_bx);
+}
+
+VECTOR_TARGET_AVX_FMA static inline float
+VectorInnerProductAvxFmaPrefetchInline(int dim, const float *ax, const float *bx, const float *pref_bx)
+{
+	VECTOR_INNER_PRODUCT_AVX_FMA_PREFETCH_IMPL(dim, ax, bx, pref_bx);
+}
+#elif defined(VECTOR_NATIVE_AVX_FMA)
+static inline float
+VectorL2SquaredDistanceAvxFmaPrefetchInline(int dim, const float *ax, const float *bx, const float *pref_bx)
+{
+	VECTOR_L2_SQUARED_AVX_FMA_PREFETCH_IMPL(dim, ax, bx, pref_bx);
+}
+
+static inline float
+VectorInnerProductAvxFmaPrefetchInline(int dim, const float *ax, const float *bx, const float *pref_bx)
+{
+	VECTOR_INNER_PRODUCT_AVX_FMA_PREFETCH_IMPL(dim, ax, bx, pref_bx);
+}
+#endif
 
 static inline float
 VectorL2SquaredDistanceScalar(int dim, const float *ax, const float *bx)

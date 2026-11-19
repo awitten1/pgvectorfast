@@ -8,7 +8,7 @@ MODULE_big = vectorfast
 DATA = $(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/sql/*--*--*.sql))
 DATA_built = sql/vector--$(EXTVERSION).sql
 DATA += sql/calico--0.1.sql sql/calico--0.2.sql sql/vectorfast--0.2.1.sql
-OBJS = src/calico.o src/calico_pool.o src/calico_lifecycle.o src/calico_intercept.o src/calico_bufmgr.o src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+OBJS = src/calico.o src/calico_pool.o src/calico_lifecycle.o src/calico_intercept.o src/calico_bufmgr.o src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswio.o src/hnswiterative.o src/hnswqueue.o src/hnswscan.o src/hnswsearch.o src/hnswutils.o src/hnswvacuum.o src/hnswvisited.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
 TESTS = $(wildcard $(srcdir)/test/sql/*.sql)
@@ -92,6 +92,8 @@ endif
 endif
 
 $(OBJS): $(srcdir)/src/calico_internal.h $(srcdir)/Makefile
+HNSW_OBJS := $(filter src/hnsw%.o,$(OBJS))
+$(HNSW_OBJS) $(HNSW_OBJS:.o=.bc): $(wildcard $(srcdir)/src/hnsw*.h) $(srcdir)/src/vector_simd.h
 src/calico_bufmgr.o src/calico_bufmgr.bc: $(srcdir)/src/calico_bufmgr$(PG_MAJOR_CALICO).inc
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)

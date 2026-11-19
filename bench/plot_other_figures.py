@@ -1,15 +1,54 @@
 #!/usr/bin/env python3
-"""Restyle the historical IVFFlat and SQL charts without rerunning benchmarks."""
+"""Render the filtered-search, IVFFlat, and SQL charts from saved measurements."""
 import argparse
 import json
 from pathlib import Path
 
 import matplotlib
 matplotlib.use('Agg')
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 
 from plot_style import (PALETTE, BASELINE_COLOR, FAST_COLOR, apply_style,
                         new_chart, add_legend, save_chart)
+
+
+def plot_filtered_arxiv(data, assets):
+    for scenario in data['scenarios']:
+        ram = scenario['ram_gib']
+        groups = scenario['groups']
+        xs = np.arange(len(groups))
+        fig, ax = new_chart('Filtered Vector Search on ArXiv', f'{ram} GiB RAM')
+        qps = {store: np.array([group[f'{store}_qps'] for group in groups])
+               for store in ('pgvector', 'pgvectorfast')}
+        medians = {store: np.median(repeats, axis=1) for store, repeats in qps.items()}
+        width = .34
+        peak = max(repeats.max() for repeats in qps.values())
+        if ram == 2:
+            ax.set_yscale('log')
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f'{value:g}'))
+            ax.set_ylim(min(repeats.min() for repeats in qps.values()) / 2, peak * 2)
+            ax.set_ylabel('QPS (median of 3 repeats, log scale)')
+        else:
+            ax.set_ylim(0, peak * 1.18)
+            ax.set_ylabel('QPS (median of 3 repeats)')
+        for store, offset, color in [('pgvector', -.5, BASELINE_COLOR),
+                                     ('pgvectorfast', .5, FAST_COLOR)]:
+            repeats = qps[store]
+            median = medians[store]
+            low, high = repeats.min(axis=1), repeats.max(axis=1)
+            positions = xs + offset * width
+            ax.bar(positions, median, width * .92, label=store, color=color,
+                   yerr=[median - low, high - median],
+                   error_kw={'capsize': 3, 'elinewidth': 1}, zorder=3)
+            for x, value, top in zip(positions, median, high):
+                digits = 2 if value < 100 else 0
+                ax.annotate(f'{value:,.{digits}f}', (x, top),
+                            xytext=(0, 4), textcoords='offset points',
+                            ha='center', va='bottom', fontsize=12)
+        ax.set_xticks(xs, [group['filter'] for group in groups])
+        add_legend(ax, 2)
+        save_chart(fig, assets / f'filtered_arxiv_{ram}g.png')
 
 
 def plot_ivfflat(data, assets):
@@ -75,6 +114,8 @@ def main():
     data = json.loads(args.data.read_text())
     args.assets.mkdir(parents=True, exist_ok=True)
     apply_style()
+    if 'filtered_arxiv' in data:
+        plot_filtered_arxiv(data['filtered_arxiv'], args.assets)
     plot_ivfflat(data['ivfflat'], args.assets)
     plot_analytical(data['analytical'], args.assets)
 

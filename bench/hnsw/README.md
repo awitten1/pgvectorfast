@@ -124,9 +124,9 @@ latest Chroma in-memory and paging measurements, with the swap settings labeled
 on the larger-than-memory figure. The CSV and tables retain the original
 four-system no-swap results.
 
-All four README figures share the fonts, colors, and layout helpers in
-`bench/plot_style.py`. Regenerate the IVFFlat and analytical-query figures from
-their recorded historical values in `bench/figure_data.json` with:
+The README figures share fonts, colors, and layout helpers in
+`bench/plot_style.py`. Use the saved measurements in `bench/figure_data.json`
+to regenerate the filtered-search, IVFFlat, and analytical-query figures.
 
 ```sh
 /tmp/hnsw-venv/bin/python bench/plot_other_figures.py --assets assets

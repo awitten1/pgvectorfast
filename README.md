@@ -16,6 +16,14 @@ Based on [pgvector](https://github.com/pgvector/pgvector/), pgvectorfast is a st
   </tr>
   <tr>
     <td width="50%" valign="top">
+      <a href="assets/filtered_arxiv_16g.png"><img src="assets/filtered_arxiv_16g.png" alt="ArXiv filtered search at 16 GiB RAM. Optimized pgvectorfast delivers 4.63× the throughput of pgvector on the balanced mix at matched recall." width="100%" /></a>
+    </td>
+    <td width="50%" valign="top">
+      <a href="assets/filtered_arxiv_2g.png"><img src="assets/filtered_arxiv_2g.png" alt="ArXiv filtered search at 2 GiB RAM. Optimized pgvectorfast delivers 9.29× the throughput of pgvector on the balanced mix at matched recall." width="100%" /></a>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
       <a href="assets/ivfflat_latency.png"><img src="assets/ivfflat_latency.png" alt="IVFFlat Median Latency (ms): pgvector vs pgvectorfast" width="100%" /></a>
     </td>
     <td width="50%" valign="top">
@@ -26,6 +34,8 @@ Based on [pgvector](https://github.com/pgvector/pgvector/), pgvectorfast is a st
 
 See [Detailed Benchmark Results](BENCHMARKS.md) for measured recall, latency breakdowns, and experimental configurations.
 
+The ArXiv figures use the optimized `perf/filtered-fast-paths` build. [Filtered benchmark details](BENCHMARKS.md#filtered-vector-search-arxiv).
+
 ## How It Works
 
 PostgreSQL's default buffer manager translates every page reference through a partitioned shared hash table and acquires atomic pins and buffer content locks on every page read. Across vector index lookups and analytical scans/joins—and especially during HNSW graph traversal, which performs thousands of irregular neighbor lookups per query—page translation, pin/unpin atomic traffic, and synchronous random I/O become major bottlenecks.
@@ -33,7 +43,7 @@ PostgreSQL's default buffer manager translates every page reference through a pa
 pgvectorfast replaces PostgreSQL's shared buffer manager with the **Calico** buffer pool ([*Making Array-Based Translation Practical for Modern, High-Performance Buffer Management*](https://arxiv.org/abs/2604.00423)), combining three techniques:
 
 1. **Array-Based Page Translation & Path Caching**: Replaces PostgreSQL's shared buffer lookup hash table and partition locks on hot paths with two-level direct array indexing backed by lazily allocated virtual memory regions, paired with a per-backend relation prefix cache (~100% hit rate on HNSW indexes).
-2. **Lock-Free Optimistic Reads (`calico.optimistic_reads`)**: Encodes lock and version state in each 64-bit translation entry so HNSW traversal reads neighbor vectors and computes L2 distances speculatively without atomic pin/unpin operations or content locks, falling back seamlessly to pinned reads whenever concurrent writes or evictions occur.
+2. **Lock-Free Optimistic Reads (`calico.optimistic_reads`)**: Encodes lock and version state in each 64-bit translation entry so HNSW traversal reads neighbor vectors and computes L2 or inner-product distances (including normalized cosine search) speculatively without atomic pin/unpin operations or content locks, falling back seamlessly to pinned reads whenever concurrent writes or evictions occur.
 3. **Workload-Aware Group Prefetch (`hnsw.enable_prefetch`)**: Batches neighbor page lookups at each HNSW graph hop to issue parallel translation loads and targeted CPU cache prefetches (`__builtin_prefetch`) for resident pages (memory-level parallelism), alongside batched asynchronous reads via PostgreSQL AIO / `io_uring` for non-resident pages (I/O-level parallelism).
 
 ## Installation
@@ -158,7 +168,7 @@ See the runnable [getting-started example](examples/getting-started.sql) and the
 
 | Parameter | Context | Default | Description |
 | --- | --- | --- | --- |
-| `calico.optimistic_reads` | Session / User | `on` | Enables lock-free optimistic tuple reads during HNSW traversal (`vector_l2_ops`). |
+| `calico.optimistic_reads` | Session / User | `on` | Enables lock-free optimistic tuple reads during HNSW traversal for `vector_l2_ops`, `vector_ip_ops`, and `vector_cosine_ops`. |
 | `hnsw.enable_prefetch` | Session / User | `on` | Enables batched neighbor group prefetching (CPU prefetch + async read batching) during HNSW search. |
 
 ## Cite pgvectorfast
