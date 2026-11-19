@@ -108,5 +108,29 @@
         ]
       }
     ]
+  },
+  "filtered_arxiv": {
+    "description": "Matched-recall runs of upstream pgvector 0.8.7 and optimized pgvectorfast perf/filtered-fast-paths (42993e12) on PostgreSQL 18.7. See BENCHMARKS.md.",
+    "pgvectorfast_image_id": "sha256:f482409ec68351e38d9cccb689ab211c2bc1601467e55b4e4461d55c820024db",
+    "scenarios": [
+      {
+        "ram_gib": 16,
+        "groups": [
+          {"filter": "Category", "pgvector_qps": [6.15529, 5.987565, 6.180214], "pgvectorfast_qps": [29.068774, 28.703844, 28.516807]},
+          {"filter": "Date range", "pgvector_qps": [146.957414, 139.549979, 145.657184], "pgvectorfast_qps": [648.477672, 649.408126, 647.48282]},
+          {"filter": "Submitter", "pgvector_qps": [2689.593189, 2409.137937, 2712.952212], "pgvectorfast_qps": [3096.730368, 3425.027132, 3420.993595]},
+          {"filter": "Balanced mix", "pgvector_qps": [17.684678, 17.182743, 17.747202], "pgvectorfast_qps": [82.721721, 81.809917, 81.292454]}
+        ]
+      },
+      {
+        "ram_gib": 2,
+        "groups": [
+          {"filter": "Category", "pgvector_qps": [0.080141, 0.080714, 0.094078], "pgvectorfast_qps": [0.747348, 0.747821, 0.745541]},
+          {"filter": "Date range", "pgvector_qps": [1.785022, 1.86611, 2.151568], "pgvectorfast_qps": [20.283616, 20.194553, 20.053431]},
+          {"filter": "Submitter", "pgvector_qps": [143.689164, 153.925221, 157.899594], "pgvectorfast_qps": [207.850716, 211.434949, 210.286319]},
+          {"filter": "Balanced mix", "pgvector_qps": [0.22997, 0.231986, 0.270255], "pgvectorfast_qps": [2.154899, 2.155999, 2.149106]}
+        ]
+      }
+    ]
   }
 }

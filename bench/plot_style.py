@@ -1,4 +1,4 @@
-"""Shared appearance for the four benchmark figures in the README."""
+"""Shared appearance for the benchmark figures in the README."""
 import matplotlib.pyplot as plt
 
 PALETTE = ['#4c78a8', '#f58518', '#b279a2', '#54a24b', '#e45756']
