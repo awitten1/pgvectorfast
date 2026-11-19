@@ -2,6 +2,7 @@
 #define HNSW_H
 
 #include "postgres.h"
+#include "hnswvisited.h"
 #include "calico_internal.h"
 #include "storage/lwlock.h"
 #include "storage/spin.h"
@@ -410,27 +411,6 @@ typedef struct HnswNeighborTupleData
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
 
-typedef struct HnswFastVisited
-{
-	uint64	   *slots;
-	uint32		mask;			/* capacity - 1 (power of 2), 0 if uninitialized */
-	uint32		count;			/* entries inserted in current generation */
-	uint32		grow_at;		/* resize threshold */
-	MemoryContext alloc_ctx;	/* context owning heap slots */
-	uint16		gen;			/* active 16-bit generation tag (1..65535) */
-	bool		on_stack;		/* true if slots points to stack buffer */
-	bool		is_backend_cache;	/* true if slots points to backend cache */
-}			HnswFastVisited;
-
-static inline uint32
-hnsw_hash_tid48(uint64 tid48)
-{
-	uint64		h = tid48 ^ (tid48 >> 25);
-
-	h *= UINT64CONST(0xbf58476d1ce4e5b9);
-	return (uint32) (h ^ (h >> 31));
-}
-
 typedef union
 {
 	struct pointerhash_hash *pointers;
@@ -445,14 +425,6 @@ typedef union
 }			HnswUnvisited;
 
 #define HNSW_HEAP_PREFETCH_MAX 12
-#define HNSW_ITER_CHUNK_BITS 10
-#define HNSW_ITER_CHUNK_SIZE (1U << HNSW_ITER_CHUNK_BITS)
-#define HNSW_ITER_CHUNK_MASK (HNSW_ITER_CHUNK_SIZE - 1U)
-#define HNSW_ITER_HEAP_PREFETCH_MAX 64
-#define HNSW_ITER_DRAIN_BATCH 256
-#define HNSW_ITER_OOM_WAVE_MAX 4
-#define HNSW_ITER_OOM_UNVISITED_CAP 256
-
 typedef struct HnswFastResultCand
 {
 	double		distance;
@@ -461,64 +433,7 @@ typedef struct HnswFastResultCand
 	uint16		_pad;
 }			HnswFastResultCand;
 
-typedef struct HnswIterativeKey
-{
-	float		distance;
-	uint32		id;
-}			HnswIterativeKey;
-
-typedef struct HnswIterativeNode
-{
-	BlockNumber neighborPage;
-	uint32		htid_meta;		/* (heap_count << 24) | extra_off */
-	OffsetNumber neighborOffno;
-	ItemPointerData first_htid;
-	uint8		level;
-	uint8		version;
-}			HnswIterativeNode;
-
-typedef struct HnswIterativeState
-{
-	HnswIterativeKey *pending;
-	HnswIterativeKey *candidates;
-	HnswIterativeKey *results;
-	int			pending_count;
-	int			pending_capacity;
-	int			candidate_capacity;
-	int			result_count;
-	int			result_capacity;
-	int			result_idx;
-	int			pref_start;
-	int			pref_end;
-	uint8		cur_rem_htids;
-	bool		oom_mode;
-	uint8		oom_hit_streak;
-	bool		pending_sorted;
-	uint8		drain_batches;
-	HnswIterativeNode **chunks;
-	uint32		node_count;
-	uint32		chunk_count;
-	uint32		chunk_capacity;
-	ItemPointerData *extra_htids;
-	uint32		extra_count;
-	uint32		extra_capacity;
-	uint32		pref_htid_meta[HNSW_ITER_HEAP_PREFETCH_MAX];
-	ItemPointerData pref_first_htids[HNSW_ITER_HEAP_PREFETCH_MAX];
-	OffsetNumber pref_offs[HNSW_ITER_HEAP_PREFETCH_MAX];
-	CalicoOptimisticSlot pref_slots[HNSW_ITER_HEAP_PREFETCH_MAX];
-}			HnswIterativeState;
-
-static inline const HnswIterativeNode *
-HnswIterativeGetNode(const HnswIterativeState *state, uint32 id)
-{
-	return &state->chunks[id >> HNSW_ITER_CHUNK_BITS][id & HNSW_ITER_CHUNK_MASK];
-}
-
-static inline bool
-HnswIterativeEmpty(const HnswIterativeState *state)
-{
-	return state->pending_count == 0;
-}
+typedef struct HnswIterativeState HnswIterativeState;
 
 typedef struct HnswScanOpaqueData
 {
@@ -526,7 +441,6 @@ typedef struct HnswScanOpaqueData
 	bool		first;
 	List	   *w;
 	visited_hash v;
-	bool		visited_cb_registered;
 	MemoryContextCallback visited_cb;
 	pairingheap *discarded;
 	HnswIterativeState *iterative;
@@ -590,17 +504,11 @@ int			HnswGetM(Relation index);
 int			HnswGetEfConstruction(Relation index);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
-void		HnswSearchIterativeFromEntry(HnswQuery * q, HnswElement entryPoint, int ef, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswIterativeState **state_ptr);
-void		HnswSearchIterativeBatch(HnswQuery * q, int ef, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswIterativeState *state, bool expand);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
 bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
-void		HnswAcquireScanVisited(HnswFastVisited *fv, MemoryContext scanCtx, MemoryContext tmpCtx, MemoryContextCallback *cb, bool *cbRegistered);
-void		HnswReleaseScanVisited(HnswFastVisited *fv);
-bool		HnswSearchLayerFastCands(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswFastResultCand *inline_buf, int inline_cap, HnswFastResultCand **fast_out, int *fast_count_out);
-bool		HnswSearchLayerFromEntryFastCands(char *base, HnswQuery * q, HnswElement entryPoint, int ef, Relation index, HnswSupport * support, int m, visited_hash * v, int64 *tuples, HnswFastResultCand *inline_buf, int inline_cap, HnswFastResultCand **fast_out, int *fast_count_out);
 void		HnswLoadFastWindow(Relation index, HnswSupport * support, const HnswFastResultCand *cands, int start_idx, int count, bool allow_deleted, ItemPointerData win_tids[][HNSW_HEAPTIDS], uint8 *win_len);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
 HnswElement HnswGetEntryPoint(Relation index);

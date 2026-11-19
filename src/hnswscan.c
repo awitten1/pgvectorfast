@@ -4,7 +4,7 @@
 
 #include "access/genam.h"
 #include "access/relscan.h"
-#include "hnsw.h"
+#include "hnswsearch.h"
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
@@ -549,7 +549,7 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 									   0, 8 * 1024, 256 * 1024);
 
 	HnswAcquireScanVisited(&so->v.tids, CurrentMemoryContext, so->tmpCtx,
-						   &so->visited_cb, &so->visited_cb_registered);
+						   &so->visited_cb);
 
 	/* Calculate max memory */
 	/* Add 256 extra bytes to fill last block when close */
@@ -586,9 +586,8 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
 	MemoryContextReset(so->tmpCtx);
-	so->visited_cb_registered = false;
 	HnswAcquireScanVisited(&so->v.tids, CurrentMemoryContext, so->tmpCtx,
-						   &so->visited_cb, &so->visited_cb_registered);
+						   &so->visited_cb);
 
 	if (keys && scan->numberOfKeys > 0)
 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
