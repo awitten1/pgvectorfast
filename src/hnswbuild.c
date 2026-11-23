@@ -36,12 +36,21 @@
  *
  * Graph import (hnsw.build_graph_file)
  *
- * Instead of building the graph by insertion, the in-memory phase can take it
- * from a file written by tools/pipnn_export (a PiPNN graph from Ginger). The
- * heap scan then only collects the elements, all on layer 0; ImportGraph()
- * matches each graph node to its element by heap TID and fills in layer 0's
- * neighbors and the entry point; FlushPages() writes the pages as usual. The
- * whole graph must fit in maintenance_work_mem, and the build is serial.
+ * Instead of building the graph by insertion, the index can take it from a
+ * file written by tools/pipnn_export (a PiPNN graph from Ginger), streaming
+ * (BuildGraphFromFile): no in-memory graph, about 42 bytes of memory per row.
+ * Every element goes on layer 0, and layer-0 tuples have a fixed size, so:
+ *
+ * 1. The heap scan writes each row's element tuple, and a placeholder for its
+ *    neighbor tuple, in scan order, with the same page layout as
+ *    CreateGraphPages(), and remembers the row's heap TID and where its two
+ *    tuples went.
+ * 2. Graph nodes are matched to rows by heap TID (both sorted).
+ * 3. The graph file's neighbor lists are streamed in, and each placeholder is
+ *    overwritten with the neighbors' element TIDs, as WriteNeighborTuples()
+ *    does.
+ *
+ * The build is serial, and fails if the table and the file disagree.
  */
 #include "postgres.h"
 
@@ -543,12 +552,6 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	{
 		LWLockRelease(&graph->allocatorLock);
 
-		if (buildstate->importGraph)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("hnsw graph import needs the whole graph in maintenance_work_mem, which ran out after " INT64_FORMAT " tuples", (int64) graph->indtuples),
-					 errhint("Increase maintenance_work_mem.")));
-
 		LWLockRelease(flushLock);
 		LWLockAcquire(flushLock, LW_EXCLUSIVE);
 
@@ -585,11 +588,8 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 	/* Create a lock for the element */
 	LWLockInitialize(&element->lock, hnsw_lock_tranche_id);
 
-	/* Insert tuple, or only collect it when the graph comes from a file */
-	if (buildstate->importGraph)
-		AddElementInMemory(base, graph, element);
-	else
-		InsertTupleInMemory(buildstate, element);
+	/* Insert tuple */
+	InsertTupleInMemory(buildstate, element);
 
 	/* Release flush lock */
 	LWLockRelease(flushLock);
@@ -747,10 +747,8 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	buildstate->ml = HnswGetMl(buildstate->m);
 	buildstate->maxLevel = HnswGetMaxLevel(buildstate->m);
 
-	/* An imported graph is single-layer: every element on layer 0 */
+	/* Take the graph from hnsw.build_graph_file (not for the init fork) */
 	buildstate->importGraph = heap != NULL && hnsw_build_graph_file != NULL && hnsw_build_graph_file[0] != '\0';
-	if (buildstate->importGraph)
-		buildstate->maxLevel = 0;
 
 	buildstate->graphCtx = GenerationContextCreate(CurrentMemoryContext,
 												   "Hnsw build graph context",
@@ -1153,15 +1151,6 @@ ReadGraphFile(FILE *f, void *buf, Size len, const char *path)
 }
 
 static int
-CompareElementTids(const void *a, const void *b)
-{
-	HnswElement ea = *(HnswElement const *) a;
-	HnswElement eb = *(HnswElement const *) b;
-
-	return ItemPointerCompare(&ea->heaptids[0], &eb->heaptids[0]);
-}
-
-static int
 CompareNodeTids(const void *a, const void *b, void *arg)
 {
 	const HnswGraphFileTid *tids = (const HnswGraphFileTid *) arg;
@@ -1176,26 +1165,150 @@ CompareNodeTids(const void *a, const void *b, void *arg)
 }
 
 /*
- * Replace the (empty) in-memory graph's layer 0 with the graph in
- * hnsw.build_graph_file
+ * A row collected by a graph import: its heap TID, and where its element
+ * tuple and neighbor tuple went in the index
+ */
+typedef struct HnswImportRow
+{
+	ItemPointerData heaptid;
+	ItemPointerData elementTid;
+	ItemPointerData neighborTid;
+}			HnswImportRow;
+
+typedef struct HnswImportState
+{
+	HnswBuildState *buildstate;
+	Buffer		buf;
+	Page		page;
+	HnswElementTuple etup;
+	HnswNeighborTuple placeholder;
+	Size		ntupSize;
+	HnswImportRow *rows;
+	uint64		nrows;
+	uint64		maxRows;
+}			HnswImportState;
+
+static int
+CompareRowTids(const void *a, const void *b, void *arg)
+{
+	const HnswImportRow *rows = (const HnswImportRow *) arg;
+
+	return ItemPointerCompare((ItemPointer) &rows[*(const uint32 *) a].heaptid,
+							  (ItemPointer) &rows[*(const uint32 *) b].heaptid);
+}
+
+/*
+ * Callback for table_index_build_scan in a graph import: write the row's
+ * element tuple and a placeholder for its neighbor tuple
  */
 static void
-ImportGraph(HnswBuildState * buildstate)
+ImportCallback(Relation index, ItemPointer tid, Datum *values,
+			   bool *isnull, bool tupleIsAlive, void *state)
+{
+	HnswImportState *is = (HnswImportState *) state;
+	HnswBuildState *buildstate = is->buildstate;
+	MemoryContext oldCtx;
+	Datum		value;
+
+	/* Skip nulls */
+	if (isnull[0])
+		return;
+
+	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
+
+	if (HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, &buildstate->support))
+	{
+		Pointer		valuePtr;
+		Size		etupSize;
+		Size		combinedSize;
+		HnswImportRow *row;
+		BlockNumber blkno;
+		OffsetNumber offno;
+
+		HnswCheckDim(buildstate->dimensions, buildstate->typeInfo, buildstate->support.collation, value);
+		valuePtr = DatumGetPointer(value);
+
+		if (is->nrows >= is->maxRows)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("the table has more rows to index than the graph file's " UINT64_FORMAT " nodes", is->maxRows),
+					 errhint("Export the graph again if the table changed.")));
+
+		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+		if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("index tuple too large")));
+		combinedSize = etupSize + is->ntupSize + sizeof(ItemIdData);
+
+		/* A layer-0 element with one heap TID */
+		MemSet(is->etup, 0, HNSW_TUPLE_ALLOC_SIZE);
+		is->etup->type = HNSW_ELEMENT_TUPLE_TYPE;
+		is->etup->level = 0;
+		is->etup->deleted = 0;
+		is->etup->version = 1;
+		is->etup->heaptids[0] = *tid;
+		for (int i = 1; i < HNSW_HEAPTIDS; i++)
+			ItemPointerSetInvalid(&is->etup->heaptids[i]);
+		memcpy(&is->etup->data, valuePtr, VARSIZE_ANY(valuePtr));
+
+		/* Keep element and neighbors on the same page if possible, as CreateGraphPages() */
+		if (PageGetFreeSpace(is->page) < etupSize || (combinedSize <= HNSW_MAX_SIZE && PageGetFreeSpace(is->page) < combinedSize))
+			HnswBuildAppendPage(index, &is->buf, &is->page, buildstate->forkNum);
+
+		blkno = BufferGetBlockNumber(is->buf);
+		offno = OffsetNumberNext(PageGetMaxOffsetNumber(is->page));
+		row = &is->rows[is->nrows++];
+		row->heaptid = *tid;
+		ItemPointerSet(&row->elementTid, blkno, offno);
+		if (combinedSize <= HNSW_MAX_SIZE)
+			ItemPointerSet(&row->neighborTid, blkno, OffsetNumberNext(offno));
+		else
+			ItemPointerSet(&row->neighborTid, blkno + 1, FirstOffsetNumber);
+		is->etup->neighbortid = row->neighborTid;
+
+		if (PageAddItem(is->page, (Item) is->etup, etupSize, InvalidOffsetNumber, false, false) != offno)
+			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+		if (PageGetFreeSpace(is->page) < is->ntupSize)
+			HnswBuildAppendPage(index, &is->buf, &is->page, buildstate->forkNum);
+
+		/* Placeholder for the neighbors, written once every element has a place */
+		if (PageAddItem(is->page, (Item) is->placeholder, is->ntupSize, InvalidOffsetNumber, false, false) !=
+			ItemPointerGetOffsetNumber(&row->neighborTid))
+			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, (int64) is->nrows);
+	}
+
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextReset(buildstate->tmpCtx);
+}
+
+/*
+ * Build the index from the graph in hnsw.build_graph_file, without an
+ * in-memory graph (see the top of this file)
+ */
+static void
+BuildGraphFromFile(HnswBuildState * buildstate)
 {
 	const char *path = hnsw_build_graph_file;
-	HnswGraph  *graph = buildstate->graph;
-	char	   *base = buildstate->hnswarea;
+	Relation	index = buildstate->index;
+	ForkNumber	forkNum = buildstate->forkNum;
 	int			layerM = HnswGetLayerM(buildstate->m, 0);
 	HnswGraphFileHeader hdr;
 	HnswGraphFileTid *tids;
-	HnswElement *elements;
-	HnswElement *nodeElements;
-	uint32	   *order;
-	uint32	   *row;
-	uint64		n = 0;
+	HnswImportState is;
+	HnswNeighborTuple ntup;
+	HnswElementData entry;
+	BlockNumber insertPage;
+	uint32	   *rowOrder;
+	uint32	   *nodeOrder;
+	uint32	   *nodeRow;
+	uint32	   *fileRow;
+	uint64		n;
 	uint64		edges = 0;
 	uint64		selfLoops = 0;
-	HnswElementPtr iter;
 	FILE	   *f;
 
 	f = AllocateFile(path, PG_BINARY_R);
@@ -1218,89 +1331,104 @@ ImportGraph(HnswBuildState * buildstate)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("graph file has up to %u neighbors per node, but m = %d stores at most %d", hdr.maxDegree, buildstate->m, layerM),
 				 errhint("Use m = %u or more.", (hdr.maxDegree + 1) / 2)));
-
-	/* The elements the heap scan collected */
-	iter = graph->head;
-	while (!HnswPtrIsNull(base, iter))
-	{
-		n++;
-		iter = HnswPtrAccess(base, iter)->next;
-	}
-	if (hdr.numNodes != n)
+	n = hdr.numNodes;
+	if (n == 0 || n > PG_UINT32_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("graph file has " UINT64_FORMAT " nodes, but the table has " UINT64_FORMAT " rows to index", hdr.numNodes, n),
-				 errhint("Export the graph again if the table changed.")));
-	if (n == 0)
-	{
-		FreeFile(f);
-		return;
-	}
+				 errmsg("graph file has " UINT64_FORMAT " nodes; expected 1 to %u", n, PG_UINT32_MAX)));
 	if (hdr.entryNode >= n)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("graph file entry node " UINT64_FORMAT " is out of range", hdr.entryNode)));
 
-	/* Match nodes to elements by heap TID: sort both by TID and walk them */
 	tids = palloc_extended(mul_size(n, sizeof(HnswGraphFileTid)), MCXT_ALLOC_HUGE);
 	ReadGraphFile(f, tids, n * sizeof(HnswGraphFileTid), path);
 
-	elements = palloc_extended(mul_size(n, sizeof(HnswElement)), MCXT_ALLOC_HUGE);
-	iter = graph->head;
+	/* 1. Element tuples and neighbor placeholders, in heap scan order */
+	CreateMetaPage(buildstate);
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_LOAD);
+
+	is.buildstate = buildstate;
+	is.buf = HnswNewBuffer(index, forkNum);
+	is.page = BufferGetPage(is.buf);
+	HnswInitPage(is.buf, is.page);
+	is.etup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+	is.placeholder = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+	is.ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(0, buildstate->m);
+	is.rows = palloc_extended(mul_size(n, sizeof(HnswImportRow)), MCXT_ALLOC_HUGE);
+	is.nrows = 0;
+	is.maxRows = n;
+
+	buildstate->reltuples = table_index_build_scan(buildstate->heap, index, buildstate->indexInfo,
+												   true, true, ImportCallback, (void *) &is, NULL);
+
+	insertPage = BufferGetBlockNumber(is.buf);
+	MarkBufferDirty(is.buf);
+	UnlockReleaseBuffer(is.buf);
+
+	if (is.nrows != n)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("the table has " UINT64_FORMAT " rows to index, but the graph file has " UINT64_FORMAT " nodes", is.nrows, n),
+				 errhint("Export the graph again if the table changed.")));
+	buildstate->indtuples = n;
+
+	/* 2. Match graph nodes to rows: sort both by heap TID and walk them */
+	rowOrder = palloc_extended(mul_size(n, sizeof(uint32)), MCXT_ALLOC_HUGE);
+	nodeOrder = palloc_extended(mul_size(n, sizeof(uint32)), MCXT_ALLOC_HUGE);
 	for (uint64 i = 0; i < n; i++)
 	{
-		elements[i] = HnswPtrAccess(base, iter);
-		iter = elements[i]->next;
+		rowOrder[i] = (uint32) i;
+		nodeOrder[i] = (uint32) i;
 	}
-	qsort(elements, n, sizeof(HnswElement), CompareElementTids);
+	qsort_arg(rowOrder, n, sizeof(uint32), CompareRowTids, is.rows);
+	qsort_arg(nodeOrder, n, sizeof(uint32), CompareNodeTids, tids);
 
-	order = palloc_extended(mul_size(n, sizeof(uint32)), MCXT_ALLOC_HUGE);
-	for (uint64 i = 0; i < n; i++)
-		order[i] = (uint32) i;
-	qsort_arg(order, n, sizeof(uint32), CompareNodeTids, tids);
-
-	nodeElements = palloc_extended(mul_size(n, sizeof(HnswElement)), MCXT_ALLOC_HUGE);
+	nodeRow = palloc_extended(mul_size(n, sizeof(uint32)), MCXT_ALLOC_HUGE);
 	for (uint64 k = 0; k < n; k++)
 	{
-		uint32		node = order[k];
-		HnswElement e = elements[k];
+		uint32		node = nodeOrder[k];
+		ItemPointer ht = &is.rows[rowOrder[k]].heaptid;
 
-		if (ItemPointerGetBlockNumberNoCheck(&e->heaptids[0]) != tids[node].block ||
-			ItemPointerGetOffsetNumberNoCheck(&e->heaptids[0]) != tids[node].offset)
+		if (ItemPointerGetBlockNumberNoCheck(ht) != tids[node].block ||
+			ItemPointerGetOffsetNumberNoCheck(ht) != tids[node].offset)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("graph file does not match the table: node %u is at TID (%u,%u), which has no row to index",
 							node, tids[node].block, tids[node].offset),
 					 errhint("Export the graph again if the table changed.")));
-		nodeElements[node] = e;
+		nodeRow[node] = rowOrder[k];
 	}
-	pfree(order);
-	pfree(elements);
+	pfree(rowOrder);
+	pfree(nodeOrder);
 	pfree(tids);
 
-	/* Layer 0 neighbors, streamed one node at a time */
-	row = palloc(mul_size(hdr.maxDegree + 1, sizeof(uint32)));
+	/* 3. Neighbor tuples, streamed from the file one node at a time */
+	ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+	fileRow = palloc(mul_size(hdr.maxDegree + 1, sizeof(uint32)));
 	for (uint64 i = 0; i < n; i++)
 	{
-		HnswNeighborArray *neighbors = HnswGetNeighbors(base, nodeElements[i], 0);
+		ItemPointer nt = &is.rows[nodeRow[i]].neighborTid;
+		Buffer		buf;
+		Page		page;
 		uint32		degree;
+		int			idx = 0;
 
 		if ((i & 0xFFFF) == 0)
 			CHECK_FOR_INTERRUPTS();
 
-		ReadGraphFile(f, row, (hdr.maxDegree + 1) * sizeof(uint32), path);
-		degree = row[0];
+		ReadGraphFile(f, fileRow, (hdr.maxDegree + 1) * sizeof(uint32), path);
+		degree = fileRow[0];
 		if (degree > hdr.maxDegree)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("graph file node " UINT64_FORMAT " has degree %u, above its maximum %u", i, degree, hdr.maxDegree)));
 
-		neighbors->length = 0;
-		neighbors->closerSet = false;
+		MemSet(ntup, 0, is.ntupSize);
+		ntup->type = HNSW_NEIGHBOR_TUPLE_TYPE;
 		for (uint32 j = 0; j < degree; j++)
 		{
-			uint32		v = row[1 + j];
-			HnswCandidate *hc;
+			uint32		v = fileRow[1 + j];
 
 			if (v >= n)
 				ereport(ERROR,
@@ -1311,19 +1439,29 @@ ImportGraph(HnswBuildState * buildstate)
 				selfLoops++;
 				continue;
 			}
-
-			/* The writer only needs the element; distances are not kept */
-			hc = &neighbors->items[neighbors->length++];
-			HnswPtrStore(base, hc->element, nodeElements[v]);
-			hc->distance = 0;
-			hc->closer = false;
+			ntup->indextids[idx++] = is.rows[nodeRow[v]].elementTid;
 		}
-		edges += neighbors->length;
-	}
-	pfree(row);
+		edges += idx;
+		while (idx < layerM)
+			ItemPointerSetInvalid(&ntup->indextids[idx++]);
+		ntup->count = layerM;
+		ntup->version = 1;
 
-	HnswPtrStore(base, graph->entryPoint, nodeElements[hdr.entryNode]);
-	pfree(nodeElements);
+		buf = ReadBufferExtended(index, forkNum, ItemPointerGetBlockNumber(nt), RBM_NORMAL, NULL);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		if (!PageIndexTupleOverwrite(page, ItemPointerGetOffsetNumber(nt), (Item) ntup, is.ntupSize))
+			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+		MarkBufferDirty(buf);
+		UnlockReleaseBuffer(buf);
+	}
+
+	/* The entry point: Ginger's, on layer 0 */
+	MemSet(&entry, 0, sizeof(entry));
+	entry.blkno = ItemPointerGetBlockNumber(&is.rows[nodeRow[hdr.entryNode]].elementTid);
+	entry.offno = ItemPointerGetOffsetNumber(&is.rows[nodeRow[hdr.entryNode]].elementTid);
+	entry.level = 0;
+	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, &entry, insertPage, forkNum, true);
 
 	if (FreeFile(f) != 0)
 		ereport(ERROR,
@@ -1334,6 +1472,13 @@ ImportGraph(HnswBuildState * buildstate)
 			(errmsg("imported graph from \"%s\": " UINT64_FORMAT " elements, mean degree %.1f, entry node " UINT64_FORMAT,
 					path, n, (double) edges / (double) n, hdr.entryNode),
 			 selfLoops > 0 ? errdetail(UINT64_FORMAT " self-loops dropped.", selfLoops) : 0));
+
+	pfree(fileRow);
+	pfree(ntup);
+	pfree(nodeRow);
+	pfree(is.rows);
+	pfree(is.etup);
+	pfree(is.placeholder);
 }
 
 /*
@@ -1344,10 +1489,17 @@ BuildGraph(HnswBuildState * buildstate)
 {
 	int			parallel_workers = 0;
 
+	/* Take the graph from a file, without an in-memory graph */
+	if (buildstate->importGraph)
+	{
+		BuildGraphFromFile(buildstate);
+		return;
+	}
+
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_LOAD);
 
-	/* Calculate parallel workers (a graph import is serial) */
-	if (buildstate->heap != NULL && !buildstate->importGraph)
+	/* Calculate parallel workers */
+	if (buildstate->heap != NULL)
 		parallel_workers = ComputeParallelWorkers(buildstate->heap, buildstate->index);
 
 	/* Attempt to launch parallel worker scan when required */
@@ -1365,10 +1517,6 @@ BuildGraph(HnswBuildState * buildstate)
 
 		buildstate->indtuples = buildstate->graph->indtuples;
 	}
-
-	/* Take the graph from the file */
-	if (buildstate->importGraph)
-		ImportGraph(buildstate);
 
 	/* Flush pages */
 	if (!buildstate->graph->flushed)

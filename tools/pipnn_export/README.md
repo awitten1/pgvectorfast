@@ -41,7 +41,6 @@ tools/pipnn_export/build/pipnn_export \
 ```
 
 ```sql
-SET maintenance_work_mem = '100GB';               -- the whole graph is built in memory
 SET hnsw.build_graph_file = '/path/items.graph';  -- superuser only; read by the server
 CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = 32);
 ```
@@ -51,9 +50,10 @@ CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = 32);
 - **Matching rows:** each graph node is matched to its row by heap TID. If the
   table changed after the export (rows added, removed or moved), `CREATE INDEX`
   fails and names the first node it can't match. Export again in that case.
-- **Build:** the build is serial. It needs about the in-memory size of an HNSW
-  build with the same `m`, and fails rather than spilling to disk if
-  `maintenance_work_mem` runs out.
+- **Build:** the build is serial and streams. It writes element tuples during
+  the heap scan, then fills in the neighbour tuples from the file. It uses
+  about 42 bytes of memory per row (about 1.1 GB for 27M rows), whatever
+  `maintenance_work_mem` is set to.
 - **Vectors and metric:** only `vector` columns and L2 distance are supported.
   Ginger builds with squared L2, which ranks the same as cosine on unit
   vectors.
