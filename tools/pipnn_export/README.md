@@ -18,8 +18,8 @@ The result is a single-layer PiPNN graph stored in an `hnsw` index, not an
 HNSW graph: there are no upper layers, and every search starts from the same
 entry point, as Ginger's own search does. Search and vacuum work unchanged.
 
-Ginger's reordering and graph compression are turned off. They only relabel
-and encode the graph for Ginger's own storage.
+Ginger's graph compression is turned off: it only encodes the graph for
+Ginger's own storage. Reordering is off by default (see `--reorder` below).
 
 ## Build
 
@@ -80,15 +80,24 @@ CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = 32);
   vectors.
 
 Options: `--alpha` (default 1.08), `--max-degree` and `--passes` (default:
-Ginger's recommended values).
+Ginger's recommended values), and `--reorder`.
+
+- **`--reorder partitioning|bisection|contraction`** (default `none`): Ginger
+  renumbers the nodes so that graph neighbours get nearby numbers, and the
+  file is written in that order. Each node keeps the TID of its row, so the
+  import builds the same index as from an unreordered file: it matches nodes
+  to rows by TID and lays elements out in heap order. The order is there for
+  an import that lays elements out in node order.
 
 ## Graph file
 
 The file is little-endian:
 - a 40-byte header: magic `PIPNNGR1`, version, maximum degree, node count,
-  entry node, dimensions;
+  entry node, dimensions, flags (bit 0: the nodes are in Ginger's reordered
+  order);
 - an 8-byte heap TID per node;
 - per node, a `uint32` degree followed by `max_degree` `uint32` neighbour
   numbers, with unused slots set to `0xFFFFFFFF`.
 
-Node `i` is the `i`-th row read.
+Without `--reorder`, node `i` is the `i`-th row read. With it, node `i` is
+Ginger's node `i`, and its TID is that of the row Ginger moved there.

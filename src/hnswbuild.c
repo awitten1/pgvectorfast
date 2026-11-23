@@ -1110,9 +1110,15 @@ ComputeParallelWorkers(Relation heap, Relation index)
  * Graph file written by tools/pipnn_export (little-endian): this header, then
  * one HnswGraphFileTid per node, then per node a uint32 degree followed by
  * maxDegree uint32 neighbor node numbers (unused slots 0xFFFFFFFF).
+ *
+ * HNSW_GRAPH_FILE_NODE_ORDER in flags says the nodes are in Ginger's
+ * reordered (locality) order rather than the order the rows were read. The
+ * import matches nodes to rows by TID and lays elements out in heap order, so
+ * it builds the same index either way.
  */
 #define HNSW_GRAPH_FILE_MAGIC "PIPNNGR1"
 #define HNSW_GRAPH_FILE_VERSION 1
+#define HNSW_GRAPH_FILE_NODE_ORDER (1u << 0)
 
 typedef struct HnswGraphFileHeader
 {
@@ -1122,7 +1128,7 @@ typedef struct HnswGraphFileHeader
 	uint64		numNodes;
 	uint64		entryNode;
 	uint32		dimensions;
-	uint32		reserved;
+	uint32		flags;
 }			HnswGraphFileHeader;
 
 typedef struct HnswGraphFileTid
