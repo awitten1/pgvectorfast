@@ -1,0 +1,3 @@
+[submodule "third_party/ginger"]
+	path = third_party/ginger
+	url = git@github.com:awitten1/ginger.git
