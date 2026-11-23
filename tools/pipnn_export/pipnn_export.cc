@@ -19,9 +19,11 @@
 // The graph is built by Ginger's own builder with the recommended config
 // (RecommendGingerConfig: PiPNN, max degree 64, two passes, robust pruning at
 // --alpha), so it is the graph a Ginger index of the same data would search.
-// Reordering and graph compression are turned off: they only relabel and
-// encode the graph for Ginger's storage. --max-degree and --passes override
-// the recommended values.
+// Graph compression is turned off: it only encodes the graph for Ginger's
+// storage. Reordering is off unless --reorder names an algorithm; then Ginger
+// renumbers the nodes so that graph neighbours get nearby numbers, and the
+// file is written in that order (see flags below). --max-degree and --passes
+// override the recommended values.
 //
 // Output (little-endian):
 //   char[8]  magic "PIPNNGR1"
@@ -30,11 +32,13 @@
 //   uint64   num_nodes
 //   uint64   entry_node        Ginger's search entry point
 //   uint32   dimensions
-//   uint32   reserved (0)
+//   uint32   flags             bit 0: node order is Ginger's reordering (a
+//                              locality order), not the order rows were read
 //   num_nodes x { uint32 block; uint16 offset; uint16 pad }   heap TID per node
 //   num_nodes x { uint32 degree; uint32 neighbor[max_degree] } unused slots
 //                                                             are 0xFFFFFFFF
-// Node i is the i-th row read.
+// Without reordering, node i is the i-th row read. With it, node i is Ginger's
+// node i, and its TID is that of the row Ginger moved there.
 
 #include <arpa/inet.h>
 #include <libpq-fe.h>
@@ -75,7 +79,19 @@ struct Options {
   float alpha = 1.08f;
   int max_degree = 0;  // 0: the recommended value
   int passes = 0;      // 0: the recommended value
+  ginger::ReorderingAlgorithm reorder = ginger::REORDERING_ALGORITHM_NONE;
 };
+
+// Graph file flags (the header's last field).
+constexpr uint32_t kFlagNodeOrder = 1u << 0;  // nodes are in Ginger's reordered order
+
+ginger::ReorderingAlgorithm ParseReorder(const std::string& s) {
+  if (s == "none") return ginger::REORDERING_ALGORITHM_NONE;
+  if (s == "partitioning") return ginger::RECURSIVE_GRAPH_PARTITIONING;
+  if (s == "bisection") return ginger::RECURSIVE_GRAPH_BISECTION;
+  if (s == "contraction") return ginger::RECURSIVE_GRAPH_CONTRACTION;
+  Die("--reorder must be partitioning, bisection, contraction or none, not \"" + s + "\"");
+}
 
 struct Tid {
   uint32_t block;
@@ -294,6 +310,7 @@ int main(int argc, char** argv) {
     else if (a == "--alpha") o.alpha = std::stof(next());
     else if (a == "--max-degree") o.max_degree = std::stoi(next());
     else if (a == "--passes") o.passes = std::stoi(next());
+    else if (a == "--reorder") o.reorder = ParseReorder(next());
     else Die("unknown argument " + a);
   }
   if (o.table.empty() || o.column.empty() || o.out.empty())
@@ -311,7 +328,7 @@ int main(int argc, char** argv) {
       ginger::RecommendGingerConfig(dim, ginger::SQUARED_L2, o.alpha);
   if (!rc.ok()) Die("RecommendGingerConfig: " + std::string(rc.status().message()));
   ginger::GingerSearcherConfig config = *std::move(rc);
-  config.set_reordering_algorithm(ginger::REORDERING_ALGORITHM_NONE);
+  config.set_reordering_algorithm(o.reorder);
   config.set_use_graph_compression(false);
   if (o.max_degree > 0) config.mutable_pipnn_config()->set_max_degree(o.max_degree);
   if (o.passes > 0) config.mutable_pipnn_config()->set_num_passes(o.passes);
@@ -320,8 +337,9 @@ int main(int argc, char** argv) {
       ginger::SpanDataset::Wrap(absl::MakeConstSpan(vectors), static_cast<size_t>(dim));
   if (!ds.ok()) Die("SpanDataset::Wrap: " + std::string(ds.status().message()));
 
-  std::fprintf(stderr, "building the PiPNN graph (max degree %d, %d passes, alpha %.2f)\n",
-               config.pipnn_config().max_degree(), config.pipnn_config().num_passes(), o.alpha);
+  std::fprintf(stderr, "building the PiPNN graph (max degree %d, %d passes, alpha %.2f, reordering %s)\n",
+               config.pipnn_config().max_degree(), config.pipnn_config().num_passes(), o.alpha,
+               std::string(ginger::ReorderingAlgorithm_Name(o.reorder)).c_str());
   const auto t0 = clk::now();
   absl::StatusOr<std::unique_ptr<ginger::GingerSearcher>> s =
       ginger::GingerSearcherBuilder(config).AddDataset(*ds).Build();
@@ -329,7 +347,21 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "built in %.0f s\n", Seconds(t0));
 
   const ginger::GingerSearcher& searcher = **s;
-  if (!searcher.remapping().empty()) Die("the graph was reordered; expected node i = row i");
+  // With reordering, Ginger has renumbered the nodes: the graph and its entry
+  // point are in the new numbers, and remapping()[r] is the row new node r
+  // came from. Only the TIDs need relabelling; without reordering node r is
+  // row r.
+  const absl::Span<const ginger::GingerNodeId> remap = searcher.remapping();
+  if (o.reorder == ginger::REORDERING_ALGORITHM_NONE && !remap.empty())
+    Die("the graph was reordered although --reorder is none");
+  if (o.reorder != ginger::REORDERING_ALGORITHM_NONE && remap.size() != n)
+    Die("expected a remapping of " + std::to_string(n) + " nodes, got " + std::to_string(remap.size()));
+  std::vector<Tid> node_tids(n);
+  for (size_t r = 0; r < n; r++) {
+    const size_t row = remap.empty() ? r : static_cast<size_t>(remap[r]);
+    if (row >= n) Die("remapping points past the last row");
+    node_tids[r] = tids[row];
+  }
   const auto* flat = std::get_if<std::unique_ptr<const ginger::FlatGraph>>(&searcher.index());
   if (flat == nullptr || *flat == nullptr) Die("the built index is not a flat graph");
   const ginger::FlatGraph& g = **flat;
@@ -338,7 +370,8 @@ int main(int argc, char** argv) {
   const uint32_t max_degree = static_cast<uint32_t>(g.MaxDegree());
   const uint64_t num_nodes = n;
   const uint64_t entry = static_cast<uint64_t>(searcher.entry_point());
-  const uint32_t version = 1, dims = static_cast<uint32_t>(dim), reserved = 0;
+  const uint32_t version = 1, dims = static_cast<uint32_t>(dim);
+  const uint32_t flags = remap.empty() ? 0 : kFlagNodeOrder;
 
   const std::string tmp = o.out + ".tmp";
   FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -349,8 +382,8 @@ int main(int argc, char** argv) {
   Write(f, &num_nodes, 8, tmp);
   Write(f, &entry, 8, tmp);
   Write(f, &dims, 4, tmp);
-  Write(f, &reserved, 4, tmp);
-  Write(f, tids.data(), tids.size() * sizeof(Tid), tmp);
+  Write(f, &flags, 4, tmp);
+  Write(f, node_tids.data(), node_tids.size() * sizeof(Tid), tmp);
   std::vector<uint32_t> row(max_degree + 1);
   uint64_t edges = 0;
   for (size_t u = 0; u < n; u++) {
@@ -363,9 +396,10 @@ int main(int argc, char** argv) {
   }
   if (std::fclose(f) != 0) Die("cannot write " + tmp);
   if (std::rename(tmp.c_str(), o.out.c_str()) != 0) Die("cannot rename " + tmp + " to " + o.out);
-  std::fprintf(stderr, "wrote %s: %llu nodes, max degree %u, mean degree %.1f, entry node %llu\n",
+  std::fprintf(stderr, "wrote %s: %llu nodes, max degree %u, mean degree %.1f, entry node %llu, %s\n",
                o.out.c_str(), static_cast<unsigned long long>(num_nodes), max_degree,
                static_cast<double>(edges) / static_cast<double>(n),
-               static_cast<unsigned long long>(entry));
+               static_cast<unsigned long long>(entry),
+               flags & kFlagNodeOrder ? "nodes in reordered order" : "nodes in read order");
   return 0;
 }
