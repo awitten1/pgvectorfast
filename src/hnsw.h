@@ -164,6 +164,7 @@ extern int	hnsw_iterative_scan;
 extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
 extern bool	hnsw_enable_prefetch;
+extern char *hnsw_build_graph_file;
 extern int	hnsw_lock_tranche_id;
 
 typedef enum HnswIterativeScanMode
@@ -351,6 +352,9 @@ typedef struct HnswBuildState
 	HnswGraph  *graph;
 	double		ml;
 	int			maxLevel;
+
+	/* Graph read from hnsw.build_graph_file instead of built by insertion */
+	bool		importGraph;
 
 	/* Memory */
 	MemoryContext graphCtx;

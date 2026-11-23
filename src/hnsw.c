@@ -37,6 +37,7 @@ int			hnsw_iterative_scan;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
 bool		hnsw_enable_prefetch = true;
+char	   *hnsw_build_graph_file = NULL;
 int			hnsw_lock_tranche_id;
 static relopt_kind hnsw_relopt_kind;
 
@@ -114,6 +115,14 @@ HnswInit(void)
 							 "Requires enable_optimistic_buffer_reads to be enabled.",
 							 &hnsw_enable_prefetch,
 							 true, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/* Reads a server file, so superuser only */
+	DefineCustomStringVariable("hnsw.build_graph_file", "Builds the index graph from a file instead of by HNSW insertion",
+							   "When set, CREATE INDEX reads a single-layer graph keyed by heap TID "
+							   "(written by tools/pipnn_export) and stores it as the index's layer 0, "
+							   "with every element on that layer. Empty builds by HNSW insertion.",
+							   &hnsw_build_graph_file,
+							   "", PGC_SUSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("hnsw");
 }
