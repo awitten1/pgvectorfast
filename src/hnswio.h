@@ -71,6 +71,27 @@ HnswGetDistanceOptimisticPrefetchImpl(HnswSupport *support, const Vector *a_vec,
 	uint32		vl_len = __atomic_load_n((const uint32 *) &b_ptr->vl_len_, __ATOMIC_RELAXED);
 	int16		b_dim = __atomic_load_n((const int16 *) &b_ptr->dim, __ATOMIC_RELAXED);
 
+	/*
+	 * A tq4 search: b is a stored element value. Check its marker,
+	 * dimensions and length before reading its codes; the caller validates
+	 * the frame afterwards.
+	 */
+	if (unlikely(a_vec->dim == HNSW_TQ_QUERY_MARKER))
+	{
+		const HnswTqQueryValue *qv = (const HnswTqQueryValue *) a_vec;
+		const HnswTqElementValue *ev = (const HnswTqElementValue *) b_ptr;
+		uint16		ev_dim = __atomic_load_n(&ev->dim, __ATOMIC_RELAXED);
+
+		(void) use_avx_fma;
+		(void) pref_bx;
+		if (unlikely(b_dim != HNSW_TQ_ELEMENT_MARKER || ev_dim != qv->dim ||
+					 (vl_len >> 2) != (uint32) vec_size || (vl_len & 0x03) != 0))
+			return false;
+
+		*distance_out = HnswTqQueryDistance(qv, ev);
+		return true;
+	}
+
 	if (unlikely(b_dim != a_vec->dim || b_dim <= 0 ||
 				 (vl_len >> 2) != (uint32) vec_size || (vl_len & 0x03) != 0))
 		return false;
@@ -317,9 +338,9 @@ HnswInitOptDistanceParams(HnswQuery *q, Relation index, HnswSupport *support,
 			else
 			{
 				queryVec = (const Vector *) DatumGetPointer(q->value);
-				if (likely(queryVec->dim > 0))
+				if (likely(HnswQueryValueSize(queryVec) > 0))
 				{
-					optVecSize = VECTOR_SIZE(queryVec->dim);
+					optVecSize = HnswQueryValueSize(queryVec);
 					if (likely(optVecSize <= BLCKSZ - offsetof(HnswElementTupleData, data)))
 					{
 						canOptDistance = true;

@@ -43,6 +43,10 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	if (DatumGetPointer(value) != NULL)
 		HnswCheckDim(dimensions, so->typeInfo, support->collation, value);
 
+	/* TurboQuant: navigate with the 4-bit query */
+	if (support->tq != NULL && DatumGetPointer(value) != NULL)
+		value = HnswTqMakeQuery(support->tq, value);
+
 	q->value = value;
 	so->m = m;
 
@@ -56,6 +60,9 @@ GetScanItems(IndexScanDesc scan, Datum value)
 										  so->fast_inline, lengthof(so->fast_inline),
 										  &so->fast_cands, &so->fast_count))
 	{
+		if (support->tq != NULL)
+			HnswTqRerankCands(index, support, q, so->fast_cands, so->fast_count);
+
 		if (so->fast_count > 0)
 		{
 			int			n_win = Min(so->fast_count, HNSW_HEAP_PREFETCH_MAX);
@@ -91,6 +98,9 @@ GetScanItems(IndexScanDesc scan, Datum value)
 								 so->fast_inline, lengthof(so->fast_inline),
 								 &so->fast_cands, &so->fast_count))
 	{
+		if (support->tq != NULL)
+			HnswTqRerankCands(index, support, q, so->fast_cands, so->fast_count);
+
 		if (so->fast_count > 0)
 		{
 			int			n_win = Min(so->fast_count, HNSW_HEAP_PREFETCH_MAX);
@@ -104,7 +114,12 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		return NIL;
 	}
 
-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
+	w = HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
+
+	if (support->tq != NULL)
+		w = HnswTqRerankList(index, support, q, w);
+
+	return w;
 }
 
 /*
@@ -539,6 +554,8 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 
 	/* Set support functions */
 	HnswInitSupport(&so->support, index);
+	if (HnswGetQuantizer(index) != HNSW_QUANTIZER_NONE)
+		so->support.tq = HnswTqGetState(index);
 
 	/*
 	 * Use a lower max allocation size than default to allow scanning more
@@ -630,6 +647,10 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		/* https://www.postgresql.org/docs/current/index-locking.html */
 		if (!IsMVCCSnapshot(scan->xs_snapshot))
 			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
+
+		/* Results of a tq4 search are re-ranked once, at the end */
+		if (so->support.tq != NULL && hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+			HnswTqCheckSupported(scan->indexRelation, "iterative scans", "Set hnsw.iterative_scan to off.");
 
 		/* Get scan value */
 		value = GetScanValue(scan);
