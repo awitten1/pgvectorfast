@@ -75,6 +75,9 @@ CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = 32);
   only, and the first such row becomes the entry point. Their neighbour lists
   are HNSW-pruned. The index stays correct, but its graph drifts from PiPNN's
   as rows are added; rebuild from a fresh export to restore it.
+- **4-bit codes:** the graph can also be stored with TurboQuant codes instead
+  of the vectors: add `quantizer = 'tq4'` to the `WITH` clause (see "4-bit
+  TurboQuant indexes" in the top-level README).
 - **Vectors and metric:** only `vector` columns and L2 distance are supported.
   Ginger builds with squared L2, which ranks the same as cosine on unit
   vectors.

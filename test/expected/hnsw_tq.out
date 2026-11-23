@@ -1,0 +1,86 @@
+SET enable_seqscan = off;
+-- L2
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = 'tq4');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   
+---------
+ [1,2,3]
+ [1,1,1]
+ [0,0,0]
+(3 rows)
+
+SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <-> (SELECT NULL::vector)) t2;
+ count 
+-------
+     3
+(1 row)
+
+DROP TABLE t;
+-- inner product
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+CREATE INDEX ON t USING hnsw (val vector_ip_ops) WITH (quantizer = 'tq4');
+SELECT * FROM t ORDER BY val <#> '[3,3,3]';
+   val   
+---------
+ [1,2,3]
+ [1,1,1]
+ [0,0,0]
+(3 rows)
+
+DROP TABLE t;
+-- cosine
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+CREATE INDEX ON t USING hnsw (val vector_cosine_ops) WITH (quantizer = 'tq4');
+SELECT * FROM t ORDER BY val <=> '[3,3,3]';
+   val   
+---------
+ [1,1,1]
+ [1,2,3]
+(2 rows)
+
+DROP TABLE t;
+-- re-rank off, and an empty index
+CREATE TABLE t (val vector(3));
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = 'tq4', rerank = 'none');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+ val 
+-----
+(0 rows)
+
+DROP TABLE t;
+-- options
+CREATE TABLE t (val vector(3));
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = 'tq8');
+ERROR:  invalid value for enum option "quantizer": tq8
+DETAIL:  Valid values are "none" and "tq4".
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (rerank = 'ntq16');
+ERROR:  invalid value for enum option "rerank": ntq16
+DETAIL:  Valid values are "none" and "ntq12".
+CREATE INDEX ON t USING hnsw (val vector_l1_ops) WITH (quantizer = 'tq4');
+ERROR:  quantizer "tq4" requires a vector column with L2, inner product or cosine distance
+DROP TABLE t;
+CREATE TABLE t (val vector(25));
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = 'tq4');
+DROP TABLE t;
+CREATE TABLE t (val vector(33));
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = 'tq4');
+ERROR:  quantizer "tq4" does not support 33 dimensions
+DETAIL:  The dimensions must be an odd number of at most 31 times a power of 2.
+DROP TABLE t;
+-- not supported yet
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[1,2,3]');
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = 'tq4');
+INSERT INTO t (val) VALUES ('[1,1,1]');
+ERROR:  hnsw indexes with quantizer "tq4" do not support inserts yet
+HINT:  Drop the index while loading data, then create it again.
+SET hnsw.iterative_scan = relaxed_order;
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+ERROR:  hnsw indexes with quantizer "tq4" do not support iterative scans yet
+HINT:  Set hnsw.iterative_scan to off.
+RESET hnsw.iterative_scan;
+DROP TABLE t;

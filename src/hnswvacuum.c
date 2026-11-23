@@ -780,6 +780,9 @@ hnswbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 {
 	HnswVacuumState vacuumstate;
 
+	/* Plain VACUUM of a table with no deleted rows does not get here */
+	HnswTqCheckSupported(info->index, "vacuuming deleted rows", "Rebuild the index with REINDEX instead.");
+
 	InitVacuumState(&vacuumstate, info, stats, callback, callback_state);
 
 	/* Pass 1: Remove heap TIDs */

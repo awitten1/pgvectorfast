@@ -155,6 +155,7 @@ HnswInitSupport(HnswSupport * support, Relation index)
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
 	calico_read_handle_init(&support->read_handle, &index->rd_locator, MAIN_FORKNUM);
+	support->tq = NULL;			/* set by the callers that use it */
 }
 
 /*
@@ -582,6 +583,18 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
+	/* A tq4 search: b is a stored element value */
+	if (unlikely(support->tq != NULL) &&
+		((const Vector *) DatumGetPointer(a))->dim == HNSW_TQ_QUERY_MARKER)
+	{
+		const HnswTqElementValue *ev = (const HnswTqElementValue *) DatumGetPointer(b);
+		const HnswTqQueryValue *qv = (const HnswTqQueryValue *) DatumGetPointer(a);
+
+		if (ev->marker != HNSW_TQ_ELEMENT_MARKER || ev->dim != qv->dim)
+			elog(ERROR, "hnsw element does not hold a TurboQuant code");
+		return HnswTqQueryDistance(qv, ev);
+	}
+
 	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 }
 
@@ -744,9 +757,9 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 
 		if (distance != NULL && a_vec != NULL)
 		{
-			if (unlikely(a_vec->dim <= 0))
+			vec_size = HnswQueryValueSize(a_vec);
+			if (unlikely(vec_size == 0))
 				goto optimistic_element_failed;
-			vec_size = VECTOR_SIZE(a_vec->dim);
 			if (unlikely(vec_size > BLCKSZ - offsetof(HnswElementTupleData, data)))
 				goto optimistic_element_failed;
 		}
@@ -1629,9 +1642,9 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		else
 		{
 			queryVec = (const Vector *) DatumGetPointer(q->value);
-			if (likely(queryVec->dim > 0))
+			if (likely(HnswQueryValueSize(queryVec) > 0))
 			{
-				optVecSize = VECTOR_SIZE(queryVec->dim);
+				optVecSize = HnswQueryValueSize(queryVec);
 				if (likely(optVecSize <= BLCKSZ - offsetof(HnswElementTupleData, data)))
 				{
 					canOptDistance = true;

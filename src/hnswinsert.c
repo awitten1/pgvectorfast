@@ -756,6 +756,8 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 	const		HnswTypeInfo *typeInfo = HnswGetTypeInfo(index);
 	HnswSupport support;
 
+	HnswTqCheckSupported(index, "inserts", "Drop the index while loading data, then create it again.");
+
 	HnswInitSupport(&support, index);
 
 	/* Form index value */

@@ -130,6 +130,10 @@ CreateMetaPage(HnswBuildState * buildstate)
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
 
+	/* TurboQuant settings and rotation */
+	if (buildstate->support.tq != NULL)
+		HnswTqSetMetaPage(page, buildstate->support.tq);
+
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
 }
@@ -179,6 +183,12 @@ CreateGraphPages(HnswBuildState * buildstate)
 	Page		page;
 	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
+	HnswTqState *tq = buildstate->support.tq;
+	HnswTqRerankWriter rerank;
+	HnswTqElementValue *tqValue = NULL;
+	HnswRerankTuple rtup = NULL;
+	Size		rtupSize = 0;
+	BlockNumber graphHead;
 
 	/* Calculate sizes */
 	maxSize = HNSW_MAX_SIZE;
@@ -187,10 +197,26 @@ CreateGraphPages(HnswBuildState * buildstate)
 	etup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 	ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 
+	/* TurboQuant: reserve the re-rank pages ahead of the graph pages */
+	if (tq != NULL)
+	{
+		uint64		count = 0;
+
+		for (HnswElementPtr it = iter; !HnswPtrIsNull(base, it); it = ((HnswElement) HnswPtrAccess(base, it))->next)
+			count++;
+
+		tqValue = palloc0(HnswTqElementValueSize(tq));
+		rtupSize = HnswTqRerankTupleSize(tq);
+		if (rtupSize > 0)
+			rtup = palloc0(rtupSize);
+		HnswTqRerankWriterInit(&rerank, tq, index, forkNum, count);
+	}
+
 	/* Prepare first page */
 	buf = HnswNewBuffer(index, forkNum);
 	page = BufferGetPage(buf);
 	HnswInitPage(buf, page);
+	graphHead = BufferGetBlockNumber(buf);
 
 	while (!HnswPtrIsNull(base, iter))
 	{
@@ -206,8 +232,18 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Zero memory for each element */
 		MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
+		/* TurboQuant: store the codes, and the re-rank bits on their own page */
+		if (tq != NULL)
+		{
+			if (rtup != NULL)
+				MemSet(rtup, 0, rtupSize);
+			HnswTqEncode(tq, PointerGetDatum(valuePtr), tqValue, rtup);
+			if (rtup != NULL)
+				HnswTqRerankWriterAdd(&rerank, rtup, rtupSize, &tqValue->reranktid);
+		}
+
 		/* Calculate sizes */
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+		etupSize = HNSW_ELEMENT_TUPLE_SIZE(tq != NULL ? VARSIZE(tqValue) : VARSIZE_ANY(valuePtr));
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
@@ -218,6 +254,14 @@ CreateGraphPages(HnswBuildState * buildstate)
 					 errmsg("index tuple too large")));
 
 		HnswSetElementTuple(base, etup, element);
+		if (tq != NULL)
+		{
+			/* The codes replace the vector; zero what is left of it */
+			Size		valueSize = VARSIZE(tqValue);
+
+			memcpy(&etup->data, tqValue, valueSize);
+			MemSet((char *) &etup->data + valueSize, 0, etupSize - offsetof(HnswElementTupleData, data) - valueSize);
+		}
 
 		/* Keep element and neighbors on the same page if possible */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
@@ -260,6 +304,16 @@ CreateGraphPages(HnswBuildState * buildstate)
 
 	entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
 	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint, insertPage, forkNum, true);
+
+	if (tq != NULL)
+	{
+		BlockNumber rerankInsertPage = HnswTqRerankWriterFinish(&rerank);
+
+		HnswTqSetRerankPages(index, rerank.head, rerankInsertPage, graphHead, forkNum);
+		pfree(tqValue);
+		if (rtup != NULL)
+			pfree(rtup);
+	}
 
 	pfree(etup);
 	pfree(ntup);
@@ -555,6 +609,14 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 		LWLockRelease(flushLock);
 		LWLockAcquire(flushLock, LW_EXCLUSIVE);
 
+		/* Quantized indexes cannot take the on-disk phase, which inserts */
+		if (support->tq != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("hnsw graph with quantizer \"tq4\" no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples", (int64) graph->indtuples),
+					 errdetail("Indexes with quantizer \"tq4\" must be built in memory."),
+					 errhint("Increase maintenance_work_mem, or build from a graph file (hnsw.build_graph_file).")));
+
 		if (!graph->flushed)
 		{
 			ereport(NOTICE,
@@ -741,6 +803,10 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 
 	/* Get support functions */
 	HnswInitSupport(&buildstate->support, index);
+
+	/* TurboQuant: the graph is built with floats, then stored as codes */
+	if (HnswGetQuantizer(index) != HNSW_QUANTIZER_NONE)
+		buildstate->support.tq = HnswTqCreateState(index, &buildstate->support, buildstate->dimensions);
 
 	InitGraph(&buildstate->graphData, NULL, mul_size(maintenance_work_mem, 1024));
 	buildstate->graph = &buildstate->graphData;
@@ -1186,6 +1252,12 @@ typedef struct HnswImportState
 	HnswImportRow *rows;
 	uint64		nrows;
 	uint64		maxRows;
+
+	/* TurboQuant */
+	HnswTqElementValue *tqValue;
+	HnswRerankTuple rtup;
+	Size		rtupSize;
+	HnswTqRerankWriter rerank;
 }			HnswImportState;
 
 static int
@@ -1233,6 +1305,17 @@ ImportCallback(Relation index, ItemPointer tid, Datum *values,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("the table has more rows to index than the graph file's " UINT64_FORMAT " nodes", is->maxRows),
 					 errhint("Export the graph again if the table changed.")));
+
+		/* TurboQuant: store the codes, and the re-rank bits on their own page */
+		if (buildstate->support.tq != NULL)
+		{
+			if (is->rtup != NULL)
+				MemSet(is->rtup, 0, is->rtupSize);
+			HnswTqEncode(buildstate->support.tq, value, is->tqValue, is->rtup);
+			if (is->rtup != NULL)
+				HnswTqRerankWriterAdd(&is->rerank, is->rtup, is->rtupSize, &is->tqValue->reranktid);
+			valuePtr = (Pointer) is->tqValue;
+		}
 
 		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
 		if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
@@ -1302,6 +1385,7 @@ BuildGraphFromFile(HnswBuildState * buildstate)
 	HnswNeighborTuple ntup;
 	HnswElementData entry;
 	BlockNumber insertPage;
+	BlockNumber graphHead;
 	uint32	   *rowOrder;
 	uint32	   *nodeOrder;
 	uint32	   *nodeRow;
@@ -1348,6 +1432,19 @@ BuildGraphFromFile(HnswBuildState * buildstate)
 	CreateMetaPage(buildstate);
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_LOAD);
 
+	/* TurboQuant: reserve the re-rank pages ahead of the graph pages */
+	is.tqValue = NULL;
+	is.rtup = NULL;
+	is.rtupSize = 0;
+	if (buildstate->support.tq != NULL)
+	{
+		is.tqValue = palloc0(HnswTqElementValueSize(buildstate->support.tq));
+		is.rtupSize = HnswTqRerankTupleSize(buildstate->support.tq);
+		if (is.rtupSize > 0)
+			is.rtup = palloc0(is.rtupSize);
+		HnswTqRerankWriterInit(&is.rerank, buildstate->support.tq, index, forkNum, n);
+	}
+
 	is.buildstate = buildstate;
 	is.buf = HnswNewBuffer(index, forkNum);
 	is.page = BufferGetPage(is.buf);
@@ -1359,12 +1456,20 @@ BuildGraphFromFile(HnswBuildState * buildstate)
 	is.nrows = 0;
 	is.maxRows = n;
 
+	graphHead = BufferGetBlockNumber(is.buf);
 	buildstate->reltuples = table_index_build_scan(buildstate->heap, index, buildstate->indexInfo,
 												   true, true, ImportCallback, (void *) &is, NULL);
 
 	insertPage = BufferGetBlockNumber(is.buf);
 	MarkBufferDirty(is.buf);
 	UnlockReleaseBuffer(is.buf);
+
+	if (buildstate->support.tq != NULL)
+	{
+		BlockNumber rerankInsertPage = HnswTqRerankWriterFinish(&is.rerank);
+
+		HnswTqSetRerankPages(index, is.rerank.head, rerankInsertPage, graphHead, forkNum);
+	}
 
 	if (is.nrows != n)
 		ereport(ERROR,
@@ -1469,8 +1574,9 @@ BuildGraphFromFile(HnswBuildState * buildstate)
 				 errmsg("could not close graph file \"%s\": %m", path)));
 
 	ereport(NOTICE,
-			(errmsg("imported graph from \"%s\": " UINT64_FORMAT " elements, mean degree %.1f, entry node " UINT64_FORMAT,
-					path, n, (double) edges / (double) n, hdr.entryNode),
+			(errmsg("imported graph from \"%s\": " UINT64_FORMAT " elements%s, mean degree %.1f, entry node " UINT64_FORMAT,
+					path, n, buildstate->support.tq != NULL ? " as tq4 codes" : "",
+					(double) edges / (double) n, hdr.entryNode),
 			 selfLoops > 0 ? errdetail(UINT64_FORMAT " self-loops dropped.", selfLoops) : 0));
 
 	pfree(fileRow);
@@ -1479,6 +1585,10 @@ BuildGraphFromFile(HnswBuildState * buildstate)
 	pfree(is.rows);
 	pfree(is.etup);
 	pfree(is.placeholder);
+	if (is.tqValue != NULL)
+		pfree(is.tqValue);
+	if (is.rtup != NULL)
+		pfree(is.rtup);
 }
 
 /*

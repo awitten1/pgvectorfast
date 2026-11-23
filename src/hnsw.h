@@ -71,6 +71,28 @@ typedef Pointer Item;
 /* Tuple types */
 #define HNSW_ELEMENT_TUPLE_TYPE  1
 #define HNSW_NEIGHBOR_TUPLE_TYPE 2
+#define HNSW_RERANK_TUPLE_TYPE   3	/* TurboQuant re-rank bits (hnswtqam.c) */
+
+/*
+ * TurboQuant (quantizer = 'tq4'). The element tuple stores 4-bit codes
+ * (HnswTqElementValue) instead of the vector, and the 4+k bit re-rank bits
+ * are on their own pages, blocks 1 to graphHead - 1, ahead of the graph.
+ * Such an index has metapage version 2.
+ */
+#define HNSW_TQ_VERSION			2
+#define HNSW_QUANTIZER_NONE		0
+#define HNSW_QUANTIZER_TQ4		1
+#define HNSW_RERANK_NONE		0
+#define HNSW_RERANK_NTQ12		1
+#define HNSW_TQ_NTQ12_EXTRA_BITS 8
+
+/* Page kinds, in HnswPageOpaqueData.unused */
+#define HNSW_PAGE_GRAPH			0
+#define HNSW_PAGE_RERANK		1
+
+/* Stored where Vector.dim is, so neither can pass for a Vector */
+#define HNSW_TQ_ELEMENT_MARKER	(-1)
+#define HNSW_TQ_QUERY_MARKER	(-2)
 
 /* Make graph robust against non-HOT updates */
 #define HNSW_HEAPTIDS 10
@@ -236,6 +258,8 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+	int			quantizer;		/* HNSW_QUANTIZER_* */
+	int			rerank;			/* HNSW_RERANK_* */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -312,6 +336,8 @@ typedef enum HnswVectorDistance
 	HNSW_VECTOR_DISTANCE_INNER_PRODUCT
 } HnswVectorDistance;
 
+typedef struct HnswTqState HnswTqState;
+
 typedef struct HnswSupport
 {
 	FmgrInfo   *procinfo;
@@ -319,6 +345,7 @@ typedef struct HnswSupport
 	Oid			collation;
 	CalicoReadHandle read_handle;
 	HnswVectorDistance vectorDistance;
+	HnswTqState *tq;			/* TurboQuant state; NULL unless tq4 */
 }			HnswSupport;
 
 typedef struct HnswQuery
@@ -378,6 +405,18 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
+	/* TurboQuant (version 2); zero on other indexes */
+	uint8		quantizer;		/* HNSW_QUANTIZER_* */
+	uint8		rerank;			/* HNSW_RERANK_* */
+	uint8		tqExtraBits;	/* k of the re-rank bits */
+	uint8		tqMetric;		/* HnswTqMetric */
+	uint32		tqSeed;
+	uint16		tqSubspaces;	/* r */
+	uint16		tqUnused;
+	BlockNumber rerankHead;		/* first re-rank page */
+	BlockNumber rerankInsertPage;	/* last re-rank page */
+	BlockNumber graphHead;		/* first graph page */
+	float4		tqRotation[FLEXIBLE_ARRAY_MEMBER];	/* r x r, column-major */
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -414,6 +453,65 @@ typedef struct HnswNeighborTupleData
 }			HnswNeighborTupleData;
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
+
+/*
+ * The value of an element tuple in a tq4 index (in place of a Vector): the
+ * 4-bit codes, the values that scale their distances, and where the
+ * element's re-rank bits are
+ */
+typedef struct HnswTqElementValue
+{
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+	int16		marker;			/* HNSW_TQ_ELEMENT_MARKER */
+	uint16		dim;
+	float4		sqNorm;			/* ||x||^2 */
+	float4		scale4;			/* 4-bit norm scaling factor */
+	ItemPointerData reranktid;	/* HnswRerankTuple, or invalid */
+	uint16		unused;
+	uint8		codes[FLEXIBLE_ARRAY_MEMBER];	/* dim / 2 bytes */
+}			HnswTqElementValue;
+
+#define HNSW_TQ_ELEMENT_VALUE_SIZE(dim) (offsetof(HnswTqElementValue, codes) + ((Size) (dim) + 1) / 2)
+
+/* The 4+k bit re-rank bits of an element, on an HNSW_PAGE_RERANK page */
+typedef struct HnswRerankTupleData
+{
+	uint8		type;			/* HNSW_RERANK_TUPLE_TYPE */
+	uint8		deleted;
+	uint16		unused;
+	float4		scale4k;		/* 4+k bit norm scaling factor */
+	uint8		extra[FLEXIBLE_ARRAY_MEMBER];
+}			HnswRerankTupleData;
+
+typedef HnswRerankTupleData * HnswRerankTuple;
+
+/*
+ * A query against a tq4 index, as HnswQuery.value: the TurboQuant query
+ * behind a varlena header that cannot pass for a Vector. Never stored.
+ */
+typedef struct HnswTqQueryValue
+{
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+	int16		marker;			/* HNSW_TQ_QUERY_MARKER */
+	uint16		dim;
+	int			metric;			/* HnswTqMetric */
+	struct HnswTqQuery *query;
+}			HnswTqQueryValue;
+
+/*
+ * Bytes of a stored value that the optimistic path reads for this query: a
+ * Vector of its dimensions, or the tq4 element value for a tq4 query. Zero if
+ * the query is neither.
+ */
+static inline Size
+HnswQueryValueSize(const Vector *query)
+{
+	if (likely(query->dim > 0))
+		return VECTOR_SIZE(query->dim);
+	if (query->dim == HNSW_TQ_QUERY_MARKER)
+		return HNSW_TQ_ELEMENT_VALUE_SIZE(((const HnswTqQueryValue *) query)->dim);
+	return 0;
+}
 
 typedef union
 {
@@ -540,6 +638,35 @@ void		HnswInitLockTranche(void);
 void		HnswCheckDim(int expected, const HnswTypeInfo * typeInfo, Oid collation, Datum value);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+
+/* TurboQuant indexes (hnswtqam.c) */
+int			HnswGetQuantizer(Relation index);
+HnswTqState *HnswTqCreateState(Relation index, const HnswSupport * support, int dimensions);
+HnswTqState *HnswTqGetState(Relation index);
+void		HnswTqCheckSupported(Relation index, const char *what, const char *hint);
+void		HnswTqSetMetaPage(Page page, const HnswTqState * tq);
+void		HnswTqSetRerankPages(Relation index, BlockNumber rerankHead, BlockNumber rerankInsertPage, BlockNumber graphHead, ForkNumber forkNum);
+Size		HnswTqElementValueSize(const HnswTqState * tq);
+int			HnswTqRerankTupleSize(const HnswTqState * tq);
+void		HnswTqEncode(HnswTqState * tq, Datum value, HnswTqElementValue * ev, HnswRerankTuple rtup);
+Datum		HnswTqMakeQuery(HnswTqState * tq, Datum value);
+double		HnswTqQueryDistance(const HnswTqQueryValue * qv, const HnswTqElementValue * ev);
+void		HnswTqRerankCands(Relation index, HnswSupport * support, HnswQuery * q, HnswFastResultCand *cands, int count);
+List	   *HnswTqRerankList(Relation index, HnswSupport * support, HnswQuery * q, List *w);
+
+typedef struct HnswTqRerankWriter
+{
+	Relation	index;
+	ForkNumber	forkNum;
+	BlockNumber head;			/* first re-rank page */
+	BlockNumber end;			/* one past the last reserved re-rank page */
+	Buffer		buf;
+	Page		page;
+}			HnswTqRerankWriter;
+
+void		HnswTqRerankWriterInit(HnswTqRerankWriter * w, HnswTqState * tq, Relation index, ForkNumber forkNum, uint64 count);
+void		HnswTqRerankWriterAdd(HnswTqRerankWriter * w, HnswRerankTuple rtup, Size rtupSize, ItemPointer tid);
+BlockNumber HnswTqRerankWriterFinish(HnswTqRerankWriter * w);
 
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);

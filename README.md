@@ -162,6 +162,22 @@ SELECT * FROM items ORDER BY embedding <-> '[...]' LIMIT 10;
 
 See the runnable [getting-started example](examples/getting-started.sql) and the full [pgvector Documentation](PGVECTOR.md) for all vector types, distance operators, iterative scans, and indexing options.
 
+## 4-bit TurboQuant indexes
+
+An HNSW index can store 4-bit [TurboQuant](https://arxiv.org/abs/2504.19874) codes instead of the vectors, as [Ginger](https://github.com/awitten1/ginger) does:
+
+```sql
+CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (quantizer = 'tq4');
+```
+
+- **What is stored:** each vector is randomly rotated and every coordinate is coded with 4 bits. A search walks the graph with 4-bit distances. It then re-scores the `ef_search` candidates it found with 8 more bits per coordinate, which sit on separate pages, and sorts them again. With `rerank = 'none'`, the 4-bit distances are final, which costs recall.
+- **Size:** at 384 dimensions, an element tuple drops from 1,616 to 288 bytes, and its re-rank bits take about 400 bytes more on the re-rank pages.
+- **The graph is built as usual,** with float distances, either by `CREATE INDEX` in memory or from a graph file (`hnsw.build_graph_file`, see [tools/pipnn_export](tools/pipnn_export/README.md)). A `CREATE INDEX` that outgrows `maintenance_work_mem` fails instead of continuing on disk.
+- **Supported:** `vector` columns with `vector_l2_ops`, `vector_ip_ops` or `vector_cosine_ops`, and dimensions that are an odd number of at most 31 times a power of 2 (for example 384 = 3 × 128, 768 or 1536).
+- **Not supported yet:** inserts after the index is built, vacuuming deleted rows, and iterative scans. Each of these fails with an error. Build the index once the table is loaded. Plain `VACUUM` of a table with no deleted rows works.
+
+The codec in `src/hnswtq.c` is a port of Ginger's. [tools/tq_check](tools/tq_check/README.md) checks it against Ginger's own.
+
 ## Configuration
 
 | Parameter | Context | Default | Description |

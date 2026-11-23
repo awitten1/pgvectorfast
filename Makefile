@@ -8,7 +8,7 @@ MODULE_big = vectorfast
 DATA = $(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/sql/*--*--*.sql))
 DATA_built = sql/vector--$(EXTVERSION).sql
 DATA += sql/calico--0.1.sql sql/calico--0.2.sql sql/vectorfast--0.2.1.sql sql/vectorfast--0.2.2.sql
-OBJS = src/calico.o src/calico_pool.o src/calico_lifecycle.o src/calico_intercept.o src/calico_bufmgr.o src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswio.o src/hnswiterative.o src/hnswqueue.o src/hnswscan.o src/hnswsearch.o src/hnswutils.o src/hnswvacuum.o src/hnswvisited.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+OBJS = src/calico.o src/calico_pool.o src/calico_lifecycle.o src/calico_intercept.o src/calico_bufmgr.o src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswio.o src/hnswiterative.o src/hnswqueue.o src/hnswscan.o src/hnswsearch.o src/hnswtq.o src/hnswtqam.o src/hnswutils.o src/hnswvacuum.o src/hnswvisited.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
 TESTS = $(wildcard $(srcdir)/test/sql/*.sql)
@@ -40,6 +40,10 @@ endif
 # - GCC (needs -ftree-vectorize OR -O3) - https://gcc.gnu.org/projects/tree-ssa/vectorization.html
 # - Clang (could use pragma instead) - https://llvm.org/docs/Vectorizers.html
 PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math -ffp-contract=fast
+
+# The TurboQuant codec must round as Ginger does (tools/tq_check), so it is
+# compiled without reassociation or contraction
+src/hnswtq.o: override CFLAGS += -fno-associative-math -fsigned-zeros -ftrapping-math -ffp-contract=off
 
 # Debug GCC auto-vectorization
 # PG_CFLAGS += -fopt-info-vec
