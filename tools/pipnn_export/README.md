@@ -11,8 +11,11 @@ PiPNN construction instead of from HNSW insertion.
    the graph to a file, keyed by heap TID.
 2. `CREATE INDEX` with `hnsw.build_graph_file` set loads that graph as the
    index's layer 0, with every element on that layer, and starts searches at
-   Ginger's entry point. The index is an ordinary HNSW index after that:
-   search, inserts and vacuum are unchanged.
+   Ginger's entry point.
+
+The result is a single-layer PiPNN graph stored in an `hnsw` index, not an
+HNSW graph: there are no upper layers, and every search starts from the same
+entry point, as Ginger's own search does. Search and vacuum work unchanged.
 
 Ginger's reordering and graph compression are turned off. They only relabel
 and encode the graph for Ginger's own storage.
@@ -54,6 +57,11 @@ CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = 32);
   the heap scan, then fills in the neighbour tuples from the file. It uses
   about 42 bytes of memory per row (about 1.1 GB for 27M rows), whatever
   `maintenance_work_mem` is set to.
+- **Later inserts:** rows inserted after the import go through normal HNSW
+  insertion. Each gets a random level, so upper layers grow from inserted rows
+  only, and the first such row becomes the entry point. Their neighbour lists
+  are HNSW-pruned. The index stays correct, but its graph drifts from PiPNN's
+  as rows are added; rebuild from a fresh export to restore it.
 - **Vectors and metric:** only `vector` columns and L2 distance are supported.
   Ginger builds with squared L2, which ranks the same as cosine on unit
   vectors.
