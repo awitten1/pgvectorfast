@@ -59,9 +59,13 @@ CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = 32);
   Partial and expression indexes aren't supported.
 - **`m`:** layer 0 holds `2 * m` neighbours, so `m = 32` fits PiPNN's 64.
   `CREATE INDEX` refuses a graph with more neighbours per node than that.
-- **Matching rows:** each graph node is matched to its row by heap TID. If the
-  table changed after the export (rows added, removed or moved), `CREATE INDEX`
-  fails and names the first node it can't match. Export again in that case.
+- **Matching rows:** each graph node is matched to its row by heap TID. The
+  import assumes the table is not written to or rewritten between the export
+  and `CREATE INDEX`; plain `VACUUM` is fine. Most changes make `CREATE INDEX`
+  fail and name the first node it can't match, but not all: export again after
+  any change. A table that has had updates should be rewritten (`VACUUM FULL`
+  or `CLUSTER`) before the export, so each row's `ctid` is the TID the index
+  build sees.
 - **Build:** the build is serial and streams. It writes element tuples during
   the heap scan, then fills in the neighbour tuples from the file. It uses
   about 42 bytes of memory per row (about 1.1 GB for 27M rows), whatever
