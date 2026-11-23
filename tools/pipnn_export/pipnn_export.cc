@@ -1,15 +1,20 @@
-// pipnn_export: builds a PiPNN graph over vectors SELECTed out of Postgres and
-// writes it, keyed by heap TID, for CREATE INDEX with hnsw.build_graph_file
-// (see README.md in this directory). Links Ginger from third_party/ginger.
+// pipnn_export: builds a PiPNN graph over a table's vectors and writes it,
+// keyed by heap TID, for CREATE INDEX with hnsw.build_graph_file (see
+// README.md in this directory). Links Ginger from third_party/ginger.
 //
 //   pipnn_export --conninfo "host=10.10.1.2 dbname=postgres user=postgres" \
-//                --query "SELECT ctid, embedding FROM items_hn" \
+//                --table items_hn --column embedding \
 //                --out /mydata/items_hn.pipnn
 //
-// The query must return two columns: the row's ctid and a pgvector `vector`.
-// Rows are read with COPY (query) TO STDOUT (FORMAT binary) inside one
-// REPEATABLE READ transaction, after a count(*) in the same snapshot, so the
-// vectors fit one exact allocation.
+// --table (optionally schema-qualified) and --column name the column that
+// CREATE INDEX will index, which must be a pgvector `vector`. The tool reads
+// exactly the rows CREATE INDEX does: every row of the table whose column is
+// not NULL, as
+//   COPY (SELECT ctid, <column> FROM <table> WHERE <column> IS NOT NULL)
+//     TO STDOUT (FORMAT binary)
+// inside one REPEATABLE READ transaction, after a count(*) in the same
+// snapshot, so the vectors fit one exact allocation. Partitioned tables are
+// refused: their rows' TIDs are per partition, and so are their indexes.
 //
 // The graph is built by Ginger's own builder with the recommended config
 // (RecommendGingerConfig: PiPNN, max degree 64, two passes, robust pruning at
@@ -29,7 +34,7 @@
 //   num_nodes x { uint32 block; uint16 offset; uint16 pad }   heap TID per node
 //   num_nodes x { uint32 degree; uint32 neighbor[max_degree] } unused slots
 //                                                             are 0xFFFFFFFF
-// Node i is the i-th row the query returned.
+// Node i is the i-th row read.
 
 #include <arpa/inet.h>
 #include <libpq-fe.h>
@@ -39,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <variant>
@@ -63,7 +69,8 @@ double Seconds(clk::time_point t0) {
 
 struct Options {
   std::string conninfo;
-  std::string query;
+  std::string table;
+  std::string column;
   std::string out;
   float alpha = 1.08f;
   int max_degree = 0;  // 0: the recommended value
@@ -121,6 +128,61 @@ PGresult* Exec(PGconn* conn, const std::string& sql, ExecStatusType want) {
   return res;
 }
 
+// Runs `sql` with text parameters; dies unless it returns exactly one row.
+PGresult* ExecOneRow(PGconn* conn, const char* sql, std::initializer_list<const char*> params,
+                     const std::string& what) {
+  std::vector<const char*> p(params);
+  PGresult* res = PQexecParams(conn, sql, static_cast<int>(p.size()), nullptr, p.data(),
+                               nullptr, nullptr, 0);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    const std::string err = PQerrorMessage(conn);
+    PQclear(res);
+    Die(what + ": " + err);
+  }
+  if (PQntuples(res) != 1) {
+    PQclear(res);
+    Die(what);
+  }
+  return res;
+}
+
+// The one query that reads what CREATE INDEX on table(column) would index.
+// The table is resolved by the server (::regclass), so its name comes back
+// schema-qualified and quoted as needed; the column is checked to be a
+// pgvector `vector` and quoted by libpq. Neither name is pasted into SQL as
+// given.
+std::string IndexedRowsQuery(PGconn* conn, const std::string& table, const std::string& column) {
+  PGresult* rel = ExecOneRow(
+      conn, "SELECT c.oid::regclass::text, c.relkind FROM pg_class c WHERE c.oid = $1::regclass",
+      {table.c_str()}, "cannot find table \"" + table + "\"");
+  const std::string qtable = PQgetvalue(rel, 0, 0);
+  const char kind = PQgetvalue(rel, 0, 1)[0];
+  PQclear(rel);
+  if (kind == 'p') Die(qtable + " is partitioned: export each partition separately");
+  if (kind != 'r' && kind != 'm') Die(qtable + " is not a table or materialized view");
+
+  PGresult* att = ExecOneRow(
+      conn,
+      "SELECT t.typname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+      "JOIN pg_type t ON t.oid = a.atttypid "
+      "WHERE a.attrelid = $1::regclass AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped",
+      {table.c_str(), column.c_str()}, qtable + " has no column \"" + column + "\"");
+  const std::string type_name = PQgetvalue(att, 0, 0);
+  const std::string type_shown = PQgetvalue(att, 0, 1);
+  PQclear(att);
+  if (type_name != "vector")
+    Die("column \"" + column + "\" of " + qtable + " is " + type_shown +
+        "; only pgvector vector columns are supported");
+
+  char* q = PQescapeIdentifier(conn, column.c_str(), column.size());
+  if (q == nullptr) Die(std::string("cannot quote the column name: ") + PQerrorMessage(conn));
+  const std::string qcol = q;
+  PQfreemem(q);
+  std::fprintf(stderr, "reading %s.%s (%s), skipping NULLs\n", qtable.c_str(), qcol.c_str(),
+               type_shown.c_str());
+  return "SELECT ctid, " + qcol + " FROM " + qtable + " WHERE " + qcol + " IS NOT NULL";
+}
+
 // Reads every row of `query` into `tids` and `vectors`; returns the dimensions.
 int ReadRows(PGconn* conn, const std::string& query, std::vector<Tid>& tids,
              std::vector<float>& vectors) {
@@ -130,7 +192,7 @@ int ReadRows(PGconn* conn, const std::string& query, std::vector<Tid>& tids,
                        PGRES_TUPLES_OK);
   const int64_t expected = std::atoll(PQgetvalue(res, 0, 0));
   PQclear(res);
-  if (expected <= 0) Die("the query returned no rows");
+  if (expected <= 0) Die("the table has no rows with a non-NULL vector");
   if (expected > INT32_MAX) Die("more rows than Ginger node ids can address");
   std::fprintf(stderr, "reading %lld rows\n", static_cast<long long>(expected));
 
@@ -170,7 +232,7 @@ int ReadRows(PGconn* conn, const std::string& query, std::vector<Tid>& tids,
         trailer = true;
         break;
       }
-      if (fields != 2) Die("the query must return exactly two columns (ctid, vector)");
+      if (fields != 2) Die("expected two columns (ctid, vector) per row");
       // ctid
       if (!r.Has(4)) { r.Seek(start); break; }
       const int32_t tlen = r.I32();
@@ -190,7 +252,7 @@ int ReadRows(PGconn* conn, const std::string& query, std::vector<Tid>& tids,
       } else if (d != dim) {
         Die("rows have different dimensions");
       }
-      if (rows >= expected) Die("the query returned more rows than counted");
+      if (rows >= expected) Die("read more rows than counted in the same snapshot");
       float* dst = vectors.data() + static_cast<size_t>(rows) * dim;
       for (int i = 0; i < d; i++) dst[i] = r.F32();
       tids.push_back(tid);
@@ -205,7 +267,7 @@ int ReadRows(PGconn* conn, const std::string& query, std::vector<Tid>& tids,
   PQclear(end);
   PQclear(Exec(conn, "COMMIT", PGRES_COMMAND_OK));
   if (!trailer) Die("COPY stream ended without its trailer");
-  if (rows != expected) Die("the query returned fewer rows than counted");
+  if (rows != expected) Die("read fewer rows than counted in the same snapshot");
   std::fprintf(stderr, "read %lld rows of %d dimensions in %.0f s\n",
                static_cast<long long>(rows), dim, Seconds(t0));
   return dim;
@@ -226,20 +288,22 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     if (a == "--conninfo") o.conninfo = next();
-    else if (a == "--query") o.query = next();
+    else if (a == "--table") o.table = next();
+    else if (a == "--column") o.column = next();
     else if (a == "--out") o.out = next();
     else if (a == "--alpha") o.alpha = std::stof(next());
     else if (a == "--max-degree") o.max_degree = std::stoi(next());
     else if (a == "--passes") o.passes = std::stoi(next());
     else Die("unknown argument " + a);
   }
-  if (o.query.empty() || o.out.empty()) Die("--query and --out are required (and usually --conninfo)");
+  if (o.table.empty() || o.column.empty() || o.out.empty())
+    Die("--table, --column and --out are required (and usually --conninfo)");
 
   PGconn* conn = PQconnectdb(o.conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) Die(std::string("cannot connect: ") + PQerrorMessage(conn));
   std::vector<Tid> tids;
   std::vector<float> vectors;
-  const int dim = ReadRows(conn, o.query, tids, vectors);
+  const int dim = ReadRows(conn, IndexedRowsQuery(conn, o.table, o.column), tids, vectors);
   PQfinish(conn);
   const size_t n = tids.size();
 

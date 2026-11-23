@@ -3,9 +3,10 @@
 Builds an HNSW index whose graph comes from [Ginger](https://github.com/awitten1/ginger)'s
 PiPNN construction instead of from HNSW insertion.
 
-1. `pipnn_export` reads the vectors out of Postgres with a query such as
-   `SELECT ctid, embedding FROM items`. It reads them with binary COPY, in one
-   REPEATABLE READ snapshot. It then builds a PiPNN graph with Ginger's
+1. `pipnn_export` reads the rows that `CREATE INDEX` on `--table`(`--column`)
+   will index: every row whose column is not NULL, with its heap TID. It reads
+   them with binary COPY, in one REPEATABLE READ snapshot. It then builds a
+   PiPNN graph with Ginger's
    recommended configuration, as `RecommendGingerConfig` sets it: up to 64
    neighbours per point, two passes, robust pruning at `--alpha`. It writes
    the graph to a file, keyed by heap TID.
@@ -39,7 +40,7 @@ cmake --build tools/pipnn_export/build --target pipnn_export
 ```sh
 tools/pipnn_export/build/pipnn_export \
   --conninfo "host=localhost dbname=postgres user=postgres" \
-  --query "SELECT ctid, embedding FROM items" \
+  --table items --column embedding \
   --out /path/items.graph
 ```
 
@@ -48,6 +49,14 @@ SET hnsw.build_graph_file = '/path/items.graph';  -- superuser only; read by the
 CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = 32);
 ```
 
+- **Table and column:** name the same table and column as the `CREATE
+  INDEX`. `--table` is a SQL name: it may be schema-qualified (`app.items`),
+  is resolved with the connection's `search_path`, and needs double quotes
+  around a part with capitals or spaces (`--table 'app."My Items"'`).
+  `--column` is the column's exact name, without quotes
+  (`--column 'Emb Col'`). The tool refuses a column that is not a pgvector
+  `vector`, and a partitioned table: export and index each partition instead.
+  Partial and expression indexes aren't supported.
 - **`m`:** layer 0 holds `2 * m` neighbours, so `m = 32` fits PiPNN's 64.
   `CREATE INDEX` refuses a graph with more neighbours per node than that.
 - **Matching rows:** each graph node is matched to its row by heap TID. If the
@@ -78,4 +87,4 @@ The file is little-endian:
 - per node, a `uint32` degree followed by `max_degree` `uint32` neighbour
   numbers, with unused slots set to `0xFFFFFFFF`.
 
-Node `i` is the `i`-th row the query returned.
+Node `i` is the `i`-th row read.
