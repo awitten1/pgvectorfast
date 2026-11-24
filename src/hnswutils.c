@@ -164,6 +164,7 @@ HnswInitSupport(HnswSupport * support, Relation index)
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
 	calico_read_handle_init(&support->read_handle, &index->rd_locator, MAIN_FORKNUM);
+	support->tq = HnswTqLoadState(index);
 }
 
 /*
@@ -579,7 +580,13 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 	if (loadVec)
 	{
 		char	   *base = NULL;
-		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
+		Datum		value;
+
+		/* Decode quantized codes for distance computations */
+		if (HnswTqMarker(&etup->data) == HNSW_TQ_CODE_MARKER)
+			value = PointerGetDatum(HnswTqDecodeCode((HnswTqCode *) &etup->data));
+		else
+			value = datumCopy(PointerGetDatum(&etup->data), false, -1);
 
 		HnswPtrStore(base, element->value, (char *) DatumGetPointer(value));
 	}
@@ -591,7 +598,40 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
+	if (unlikely(support->tq != NULL))
+	{
+		/* A stored code read in place, or two in-memory values */
+		if (HnswTqMarker(DatumGetPointer(b)) == HNSW_TQ_CODE_MARKER)
+			return HnswTqCodeDistance(support->tq, a, (const HnswTqCode *) DatumGetPointer(b));
+		return HnswTqValueDistance(support, a, b);
+	}
+
 	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
+}
+
+/*
+ * Can the lock-free path score this index? Plain vectors only under L2; a
+ * TurboQuant index under any metric, since its codes are scored by hnswtq.c.
+ */
+static inline bool
+HnswOptDistanceOk(const HnswSupport * support)
+{
+	return support->tq != NULL || support->procinfo->fn_addr == vector_l2_squared_distance;
+}
+
+/*
+ * Bytes of the stored value the lock-free path reads for this query: a
+ * Vector of the query's dimensions, or a 4-bit code of its padded
+ * dimensions. Zero if the query value is neither.
+ */
+static inline Size
+HnswOptValueSize(const Vector *query)
+{
+	if (likely(query->dim > 0))
+		return VECTOR_SIZE(query->dim);
+	if (query->dim == HNSW_TQ_VALUE_MARKER)
+		return HNSW_TQ_CODE_SIZE(((const HnswTqValue *) query)->pdim);
+	return 0;
 }
 
 /* Read a line pointer once and bound every speculative tuple access to this
@@ -623,6 +663,25 @@ HnswGetDistanceOptimistic(const Vector *a_vec, const Vector *b_ptr, Size vec_siz
 {
 	uint32		vl_len = __atomic_load_n((const uint32 *) &b_ptr->vl_len_, __ATOMIC_RELAXED);
 	int16		b_dim = __atomic_load_n((const int16 *) &b_ptr->dim, __ATOMIC_RELAXED);
+
+	/*
+	 * TurboQuant: the query is a rotated value and the stored value a 4-bit
+	 * code. Check marker, padded dimensions and length before reading the
+	 * code; the caller validates the frame version afterwards.
+	 */
+	if (unlikely(a_vec->dim == HNSW_TQ_VALUE_MARKER))
+	{
+		const HnswTqValue *qv = (const HnswTqValue *) a_vec;
+		const HnswTqCode *code = (const HnswTqCode *) b_ptr;
+		uint16		pdim = __atomic_load_n(&code->pdim, __ATOMIC_RELAXED);
+
+		if (unlikely(b_dim != HNSW_TQ_CODE_MARKER || pdim != qv->pdim ||
+					 (vl_len >> 2) != (uint32) vec_size || (vl_len & 0x03) != 0))
+			return false;
+
+		*distance_out = HnswTqCodeDistanceOptimistic(qv, code);
+		return true;
+	}
 
 	if (unlikely(b_dim != a_vec->dim || b_dim <= 0 ||
 				 (vl_len >> 2) != (uint32) vec_size || (vl_len & 0x03) != 0))
@@ -773,7 +832,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	 * This avoids taking buffer locks for read-only access.
 	 */
 	if (calico_enable_optimistic_reads && !loadVec &&
-	    support->procinfo->fn_addr == vector_l2_squared_distance &&
+	    HnswOptDistanceOk(support) &&
 	    calico_is_active() && !RelationUsesLocalBuffers(index))
 	{
 		const Vector *a_vec = (const Vector *) DatumGetPointer(q->value);
@@ -785,9 +844,9 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 
 		if (distance != NULL && a_vec != NULL)
 		{
-			if (unlikely(a_vec->dim <= 0))
+			vec_size = HnswOptValueSize(a_vec);
+			if (unlikely(vec_size == 0))
 				goto optimistic_element_failed;
-			vec_size = VECTOR_SIZE(a_vec->dim);
 			if (unlikely(vec_size > BLCKSZ - offsetof(HnswElementTupleData, data)))
 				goto optimistic_element_failed;
 		}
@@ -1516,6 +1575,90 @@ HnswPrefetchSlotTuple(const CalicoOptimisticSlot *slot, OffsetNumber offno, Size
 	(void) HnswPrefetchSlotTupleEx(slot, offno, tuple_bytes, 0);
 }
 
+/*
+ * Pipelined layer-0 hop (hnsw.pipeline_hop). Reaching a neighbour's tuple
+ * takes three dependent reads: its block's translation entry, the line
+ * pointer in the buffer page, then the tuple. Instead of doing each stage for
+ * every unvisited neighbour before the next (which requests more lines at
+ * once than the L1 has fill buffers, and reads each stage's data right after
+ * prefetching it), loop step i prefetches neighbour i + ENTRY's entry, reads
+ * neighbour i + LINP's entry and prefetches its line pointer, reads neighbour
+ * i + TUPLE's line pointer and prefetches its tuple lines, then computes
+ * neighbour i's distance. The same neighbours are evaluated in the same order.
+ */
+#define HNSW_PIPE_ENTRY_AHEAD 6
+#define HNSW_PIPE_LINP_AHEAD 4
+#define HNSW_PIPE_TUPLE_AHEAD 2
+
+/* Read one neighbour's translation entry into its slot; prefetch its line pointer. */
+static pg_attribute_always_inline void
+HnswPipeLookupSlot(CalicoReadHandle *handle, const ItemPointerData *tid,
+				   CalicoOptimisticSlot *slot)
+{
+	OffsetNumber offno = ItemPointerGetOffsetNumber(tid);
+	uint64		version = 0;
+	uint32		frame_id = 0;
+	void	   *entry_ptr = NULL;
+
+	if (likely(calico_optimistic_lookup_handle_frame(handle, ItemPointerGetBlockNumber(tid),
+													 &version, &frame_id, &entry_ptr)))
+	{
+		slot->entry_ptr = (CalicoTranslationEntry *) entry_ptr;
+		slot->version = version;
+		slot->frame_id = frame_id;
+		slot->resident = true;
+		slot->opt_valid = true;
+		pg_read_barrier();
+		if (likely(offno >= FirstOffsetNumber &&
+				   offno <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData)))
+			__builtin_prefetch(PageGetItemId(CalicoFramePage(frame_id), offno), 0, 3);
+	}
+	else
+	{
+		/* Not resident, or not readable optimistically: the slow path reads it. */
+		slot->entry_ptr = NULL;
+		slot->version = 0;
+		slot->frame_id = 0;
+		slot->resident = false;
+		slot->opt_valid = false;
+	}
+}
+
+/* Before step 0: entries 0..ENTRY-1 are already prefetched (HnswLoadUnvisitedRaw). */
+static pg_attribute_always_inline void
+HnswPipePrologue(CalicoReadHandle *handle, const HnswUnvisited *unvisited, int n,
+				 CalicoOptimisticSlot *slots, HnswElementTuple *etups,
+				 Size prefetch_bytes, Size min_valid_bytes)
+{
+	for (int j = 0; j < Min(n, HNSW_PIPE_LINP_AHEAD); j++)
+		HnswPipeLookupSlot(handle, &unvisited[j].indextid, &slots[j]);
+	for (int j = 0; j < Min(n, HNSW_PIPE_TUPLE_AHEAD); j++)
+		etups[j] = HnswPrefetchSlotTupleEx(&slots[j],
+										   ItemPointerGetOffsetNumber(&unvisited[j].indextid),
+										   prefetch_bytes, min_valid_bytes);
+}
+
+/* Loop step i, before neighbour i's distance. */
+static pg_attribute_always_inline void
+HnswPipeStep(CalicoReadHandle *handle, const HnswUnvisited *unvisited, int n, int i,
+			 CalicoOptimisticSlot *slots, HnswElementTuple *etups,
+			 Size prefetch_bytes, Size min_valid_bytes)
+{
+	int			j;
+
+	j = i + HNSW_PIPE_ENTRY_AHEAD;
+	if (j < n)
+		calico_optimistic_prefetch_block(handle, ItemPointerGetBlockNumber(&unvisited[j].indextid));
+	j = i + HNSW_PIPE_LINP_AHEAD;
+	if (j < n)
+		HnswPipeLookupSlot(handle, &unvisited[j].indextid, &slots[j]);
+	j = i + HNSW_PIPE_TUPLE_AHEAD;
+	if (j < n)
+		etups[j] = HnswPrefetchSlotTupleEx(&slots[j],
+										   ItemPointerGetOffsetNumber(&unvisited[j].indextid),
+										   prefetch_bytes, min_valid_bytes);
+}
+
 static pg_noinline bool
 HnswLoadNeighborTidsAndHashSlow(BlockNumber neighborPage, OffsetNumber neighborOffno,
 								uint8 level, uint8 version, Relation index,
@@ -1690,6 +1833,11 @@ HnswLoadUnvisitedMissingOrPinSlow(Relation index, HnswSupport * support,
  * Populates slots_out (aligned 1-to-1 with unvisited[]) for downstream optimistic access and prefetching.
  * When batch_out_ptr != NULL and missing blocks exist, starts async AIO reads without
  * waiting so caller can evaluate resident neighbors concurrently.
+ *
+ * pipelined (hnsw.pipeline_hop): only prefetch the first HNSW_PIPE_ENTRY_AHEAD
+ * translation entries and leave the slots unresolved; the caller moves each
+ * neighbour through the stages (HnswPipePrologue, HnswPipeStep). Missing
+ * blocks then go through the per-neighbour slow path instead of async reads.
  */
 static pg_noinline void
 HnswLoadUnvisitedRaw(BlockNumber neighborPage, OffsetNumber neighborOffno,
@@ -1699,7 +1847,7 @@ HnswLoadUnvisitedRaw(BlockNumber neighborPage, OffsetNumber neighborOffno,
 					 int m, int lm, int lc,
 					 CalicoOptimisticSlot *slots_out, Size tuple_prefetch_bytes,
 					 Size min_valid_bytes, HnswElementTuple *etups_out,
-					 CalicoAsyncBatch **batch_out_ptr)
+					 CalicoAsyncBatch **batch_out_ptr, bool pipelined)
 {
 	bool		use_prefetch = false;
 	BlockNumber batch_blocknums[HNSW_MAX_M * 2];
@@ -1849,7 +1997,8 @@ have_tids:
 										 offno <= (BLCKSZ - SizeOfPageHeaderData) / sizeof(ItemIdData))
 					? (uint16) (offsetof(PageHeaderData, pd_linp) + (offno - 1) * sizeof(ItemIdData))
 					: 0;
-				if (likely(support != NULL))
+				if (likely(support != NULL) &&
+					(!pipelined || ulen < HNSW_PIPE_ENTRY_AHEAD))
 					calico_optimistic_prefetch_block(&support->read_handle, blkno);
 			}
 
@@ -1858,7 +2007,7 @@ have_tids:
 	}
 
 	*unvisitedLength = ulen;
-	if (likely(use_prefetch && ulen > 0))
+	if (likely(use_prefetch && ulen > 0 && !pipelined))
 	{
 		int			count = ulen;
 
@@ -1937,7 +2086,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 						 element->level, element->version,
 						 unvisited, unvisitedLength, v, index, support,
 						 m, lm, lc, slots_out, tuple_prefetch_bytes, 0, NULL,
-						 batch_out_ptr);
+						 batch_out_ptr, false);
 }
 
 static pg_attribute_always_inline void
@@ -2715,6 +2864,7 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 	Size		rawPrefetchBytes;
 	Size		minValidBytes;
 	const bool	doPipe = (doPrefetch && optActive && lc == 0);
+	bool		doPipeHop;
 
 	if (likely(ef <= lengthof(w_stack)))
 	{
@@ -2747,8 +2897,7 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 		optVecSize = 0;
 		optPrefetchBytes = 0;
 
-		if (optActive &&
-			support->procinfo->fn_addr == vector_l2_squared_distance)
+		if (optActive && HnswOptDistanceOk(support))
 		{
 			if (DatumGetPointer(q->value) == NULL)
 			{
@@ -2758,9 +2907,9 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 			else
 			{
 				queryVec = (const Vector *) DatumGetPointer(q->value);
-				if (likely(queryVec->dim > 0))
+				if (likely(HnswOptValueSize(queryVec) > 0))
 				{
-					optVecSize = VECTOR_SIZE(queryVec->dim);
+					optVecSize = HnswOptValueSize(queryVec);
 					if (likely(optVecSize <= BLCKSZ - offsetof(HnswElementTupleData, data)))
 					{
 						canOptL2 = true;
@@ -2778,6 +2927,7 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 
 	rawPrefetchBytes = doPrefetch ? optPrefetchBytes : 0;
 	minValidBytes = offsetof(HnswElementTupleData, data) + optVecSize;
+	doPipeHop = (hnsw_pipeline_hop && doPipe && canOptL2 && optPrefetchBytes > 0);
 
 	if (use_local_v)
 	{
@@ -2909,13 +3059,18 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 							 m, lm, lc, unvisited_slots,
 							 rawPrefetchBytes, minValidBytes,
 							 canOptL2 ? cand_etups : NULL,
-							 &async_batch);
+							 &async_batch, doPipeHop);
 
 		if (tuples != NULL)
 			(*tuples) += unvisitedLength;
 
 		if (likely(async_batch == NULL || !async_batch->active))
 		{
+			if (doPipeHop)
+				HnswPipePrologue(read_handle, unvisited, unvisitedLength,
+								 unvisited_slots, cand_etups,
+								 optPrefetchBytes, minValidBytes);
+
 			for (int i = 0; i < unvisitedLength; i++)
 			{
 				ItemPointer indextid = &unvisited[i].indextid;
@@ -2926,7 +3081,11 @@ HnswSearchLayerDiskFastCore(char *base, HnswQuery * q, List *ep,
 				bool		alwaysAdd = (wlen < ef);
 				double		maxDist = alwaysAdd ? 0.0 : w_heap[0].distance;
 
-				if (doPrefetch && i + HNSW_PREFETCH_AHEAD < unvisitedLength)
+				if (doPipeHop)
+					HnswPipeStep(read_handle, unvisited, unvisitedLength, i,
+								 unvisited_slots, cand_etups,
+								 optPrefetchBytes, minValidBytes);
+				else if (doPrefetch && i + HNSW_PREFETCH_AHEAD < unvisitedLength)
 				{
 					cand_etups[i + HNSW_PREFETCH_AHEAD] =
 						HnswPrefetchSlotTupleEx(&unvisited_slots[i + HNSW_PREFETCH_AHEAD],
@@ -3252,7 +3411,7 @@ HnswSearchLayerUpperDiskFast(HnswQuery * q, HnswElement entryPoint,
 									 rawPrefetchBytes,
 									 minValidBytes,
 									 canOptL2 ? cand_etups : NULL,
-									 &async_batch);
+									 &async_batch, false);
 
 				if (likely(async_batch == NULL || !async_batch->active))
 				{
@@ -3389,7 +3548,7 @@ HnswSearchLayerFromEntryFastCands(char *base, HnswQuery * q, HnswElement entryPo
 		support != NULL &&
 		calico_is_active() && !RelationUsesLocalBuffers(index))
 	{
-		if (support->procinfo->fn_addr == vector_l2_squared_distance)
+		if (HnswOptDistanceOk(support))
 		{
 			if (DatumGetPointer(q->value) == NULL)
 			{
@@ -3399,9 +3558,9 @@ HnswSearchLayerFromEntryFastCands(char *base, HnswQuery * q, HnswElement entryPo
 			else
 			{
 				queryVec = (const Vector *) DatumGetPointer(q->value);
-				if (likely(queryVec->dim > 0))
+				if (likely(HnswOptValueSize(queryVec) > 0))
 				{
-					optVecSize = VECTOR_SIZE(queryVec->dim);
+					optVecSize = HnswOptValueSize(queryVec);
 					if (likely(optVecSize <= BLCKSZ - offsetof(HnswElementTupleData, data)))
 					{
 						canOptL2 = true;
@@ -3617,7 +3776,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 	if (!inMemory && !inserting && calico_enable_optimistic_reads &&
 		support != NULL &&
-		support->procinfo->fn_addr == vector_l2_squared_distance &&
+		HnswOptDistanceOk(support) &&
 		calico_is_active() && !RelationUsesLocalBuffers(index))
 	{
 		if (DatumGetPointer(q->value) == NULL)
@@ -3628,9 +3787,9 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		else
 		{
 			queryVec = (const Vector *) DatumGetPointer(q->value);
-			if (likely(queryVec->dim > 0))
+			if (likely(HnswOptValueSize(queryVec) > 0))
 			{
-				optVecSize = VECTOR_SIZE(queryVec->dim);
+				optVecSize = HnswOptValueSize(queryVec);
 				if (likely(optVecSize <= BLCKSZ - offsetof(HnswElementTupleData, data)))
 				{
 					canOptL2 = true;

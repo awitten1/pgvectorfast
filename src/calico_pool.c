@@ -342,7 +342,7 @@ calico_attach_extent(uint32 ext_id)
         elog(ERROR, "Calico cannot map extent \"%s\" (%zu bytes): %m", name, len);
     }
 
-    (void) madvise(addr, len, MADV_NOHUGEPAGE);
+    (void) madvise(addr, len, calico_huge_translation ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
     calico_record_local_extent(ext_id, addr, len);
     return (char *) addr;
 }
@@ -367,7 +367,9 @@ calico_resolve_token(uint64 tok)
 /*
  * Allocate and publish a fresh POSIX shm extent while holding alloc_lock.
  * ftruncate() leaves physical tmpfs pages uncommitted until actually touched;
- * MADV_NOHUGEPAGE keeps demand-fault granularity at 4 KiB.
+ * MADV_NOHUGEPAGE keeps demand-fault granularity at 4 KiB, unless
+ * calico.huge_translation asks for 2 MiB pages (fewer TLB misses on large
+ * relations; needs /dev/shm mounted with huge=advise).
  */
 static uint32
 calico_create_extent(Size bytes)
@@ -418,7 +420,7 @@ calico_create_extent(Size bytes)
                                name, bytes)));
     }
 
-    (void) madvise(addr, bytes, MADV_NOHUGEPAGE);
+    (void) madvise(addr, bytes, calico_huge_translation ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
     calico_record_local_extent(ext_id, addr, bytes);
 
     /*

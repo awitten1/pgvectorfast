@@ -758,6 +758,13 @@ HnswInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid
 
 	HnswInitSupport(&support, index);
 
+	/* This build reads TurboQuant indexes; it cannot write them */
+	if (support.tq != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("inserting into quantized hnsw indexes is not supported by pgvectorfast"),
+				 errhint("Use pgvector_ntq for this operation.")));
+
 	/* Form index value */
 	if (!HnswFormIndexValue(&value, values, isnull, typeInfo, &support))
 		return;

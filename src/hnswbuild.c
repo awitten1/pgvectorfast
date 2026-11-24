@@ -724,6 +724,13 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	/* Get support functions */
 	HnswInitSupport(&buildstate->support, index);
 
+	/* This build reads TurboQuant indexes; it cannot write them */
+	if (HnswGetQuantizer(index) != HNSW_QUANTIZER_NONE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("building quantized hnsw indexes is not supported by pgvectorfast"),
+				 errhint("Use pgvector_ntq for this operation.")));
+
 	InitGraph(&buildstate->graphData, NULL, mul_size(maintenance_work_mem, 1024));
 	buildstate->graph = &buildstate->graphData;
 	buildstate->ml = HnswGetMl(buildstate->m);

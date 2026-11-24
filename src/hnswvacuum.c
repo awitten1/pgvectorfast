@@ -752,6 +752,13 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
 
 	HnswInitSupport(&vacuumstate->support, index);
 
+	/* This build reads TurboQuant indexes; it cannot write them */
+	if (vacuumstate->support.tq != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("vacuuming quantized hnsw indexes is not supported by pgvectorfast"),
+				 errhint("Use pgvector_ntq for this operation.")));
+
 	/* Get m from metapage */
 	HnswGetMetaPageInfo(index, &vacuumstate->m, NULL, NULL);
 

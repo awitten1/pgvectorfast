@@ -20,6 +20,7 @@ static bool prepared;
 static ProcessUtility_hook_type previous_utility;
 static bool installing_vectorfast;
 bool calico_enable_optimistic_reads = true;
+bool calico_huge_translation = false;
 
 /*
  * vectorfast is an umbrella extension; vector retains ownership of its types
@@ -157,6 +158,13 @@ CalicoInit(void)
     DefineCustomBoolVariable("calico.optimistic_reads",
         "Use Calico optimistic HNSW reads when the pool is active.", NULL,
         &calico_enable_optimistic_reads, true, PGC_USERSET, 0, NULL, NULL, NULL);
+    DefineCustomBoolVariable("calico.huge_translation",
+        "Ask for transparent huge pages on Calico's translation extents.",
+        "Off keeps them on 4 KiB pages (MADV_NOHUGEPAGE). On asks for 2 MiB pages "
+        "(MADV_HUGEPAGE), which takes effect only if /dev/shm is mounted with "
+        "huge=advise (or shmem THP is forced): fewer TLB misses on large "
+        "relations, at least 2 MiB of memory per touched array.",
+        &calico_huge_translation, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
     if (process_shared_preload_libraries_in_progress)
     {
         if (PG_VERSION_NUM < 180000 || PG_VERSION_NUM >= 200000 ||

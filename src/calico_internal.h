@@ -114,6 +114,7 @@ extern void calico_interception_finish(void);
 extern void calico_install_bufmgr(void);
 extern void CalicoInit(void);
 extern __attribute__((visibility("hidden"))) bool calico_enable_optimistic_reads;
+extern __attribute__((visibility("hidden"))) bool calico_huge_translation;
 extern BufferDesc *CalicoLookupAndOptimisticPin(SMgrRelation smgr,
     ForkNumber fork, BlockNumber block, bool *found, uint64 *version,
     uint32 *frame, void **entry);

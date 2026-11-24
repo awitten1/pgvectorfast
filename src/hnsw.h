@@ -70,6 +70,36 @@ typedef Pointer Item;
 /* Tuple types */
 #define HNSW_ELEMENT_TUPLE_TYPE  1
 #define HNSW_NEIGHBOR_TUPLE_TYPE 2
+#define HNSW_RERANK_TUPLE_TYPE   3	/* experimental TurboQuant re-rank payload */
+
+/*
+ * Experimental TurboQuant navigation codes (version 2 metapage)
+ *
+ * A quantized index stores a 4-bit code (HnswTqCode) as the element tuple's
+ * value instead of the full vector, and a re-rank payload in a separate
+ * HnswRerankTuple on its own chain of pages.
+ */
+#define HNSW_TQ_VERSION			2
+#define HNSW_QUANTIZER_NONE		0
+#define HNSW_QUANTIZER_TQ4		1
+#define HNSW_RERANK_NONE		0
+#define HNSW_RERANK_NTQ10		1
+#define HNSW_RERANK_NTQ12		2
+#define HNSW_RERANK_EXACT		3
+#define HNSW_TQ_DIST_L2			1
+#define HNSW_TQ_DIST_NEG_IP		2
+#define HNSW_TQ_MAX_R			31
+#define HNSW_TQ_SEED			UINT64CONST(0x9E3779B97F4A7C15)
+
+/* Page kinds stored in HnswPageOpaqueData.unused */
+#define HNSW_PAGE_GRAPH			0
+#define HNSW_PAGE_RERANK		1
+
+/* Markers stored where Vector.dim would be (dim is never negative) */
+#define HNSW_TQ_CODE_MARKER		(-1)
+#define HNSW_TQ_VALUE_MARKER	(-2)
+#define HnswTqMarker(ptr)		(((const int16 *) ((const char *) (ptr) + VARHDRSZ))[0])
+
 
 /* Make graph robust against non-HOT updates */
 #define HNSW_HEAPTIDS 10
@@ -163,6 +193,7 @@ extern int	hnsw_iterative_scan;
 extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
 extern bool	hnsw_enable_prefetch;
+extern bool	hnsw_pipeline_hop;
 extern int	hnsw_lock_tranche_id;
 
 typedef enum HnswIterativeScanMode
@@ -234,6 +265,8 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+	int			quantizer;		/* HNSW_QUANTIZER_* */
+	int			rerank;			/* HNSW_RERANK_* */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -303,12 +336,28 @@ typedef struct HnswTypeInfo
 	void		(*checkValue) (Pointer v);
 }			HnswTypeInfo;
 
+/* Experimental TurboQuant state (NULL in HnswSupport for regular indexes) */
+typedef struct HnswTqState
+{
+	int			rerank;			/* HNSW_RERANK_* */
+	int			distance;		/* HNSW_TQ_DIST_* */
+	int			dim;			/* original dimensions */
+	int			pdim;			/* padded dimensions: r * blockSize */
+	int			r;				/* odd factor, <= HNSW_TQ_MAX_R */
+	int			blockSize;		/* power of two */
+	int			refineBits;		/* k for NTQ re-rank, else 0 */
+	uint64		seed;
+	float	   *signs;			/* pdim random signs (+1/-1) */
+	float	   *Q;				/* r x r orthogonal matrix, row-major */
+}			HnswTqState;
+
 typedef struct HnswSupport
 {
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
 	CalicoReadHandle read_handle;
+	HnswTqState *tq;			/* TurboQuant state, NULL for regular indexes */
 }			HnswSupport;
 
 typedef struct HnswQuery
@@ -365,6 +414,18 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
+	/* Experimental quantization (version 2, zero for older metapages) */
+	uint8		quantizer;		/* HNSW_QUANTIZER_* */
+	uint8		rerank;			/* HNSW_RERANK_* */
+	uint8		tqDistance;		/* HNSW_TQ_DIST_* */
+	uint8		tqR;			/* odd factor of padded dimensions */
+	uint16		tqPdim;			/* padded dimensions */
+	uint16		tqUnused;
+	uint32		tqSeedLo;
+	uint32		tqSeedHi;
+	BlockNumber rerankHeadBlkno;
+	BlockNumber rerankInsertPage;
+	float4		tqQ[FLEXIBLE_ARRAY_MEMBER]; /* tqR x tqR rotation matrix */
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -401,6 +462,62 @@ typedef struct HnswNeighborTupleData
 }			HnswNeighborTupleData;
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
+
+/*
+ * 4-bit navigation code, stored as the value (data) of an element tuple in a
+ * quantized index. Coordinate 2i is the low nibble of code[i], 2i+1 the high
+ * nibble. Each nibble is (negative << 3) | u, where u indexes the 4-bit
+ * Gaussian Lloyd-Max codebook.
+ */
+typedef struct HnswTqCode
+{
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+	int16		marker;			/* HNSW_TQ_CODE_MARKER */
+	uint16		pdim;			/* padded dimensions */
+	float4		scale;			/* s_4(x) = ||x|| / (sqrt(1 - D_4) ||y~||) */
+	float4		norm;			/* ||x|| */
+	ItemPointerData reranktid;	/* re-rank tuple, or invalid */
+	uint16		unused;
+	uint8		code[FLEXIBLE_ARRAY_MEMBER];
+}			HnswTqCode;
+
+#define HNSW_TQ_CODE_SIZE(pdim)	(offsetof(HnswTqCode, code) + ((pdim) + 1) / 2)
+
+/*
+ * In-memory value for distance computations in a quantized index (never
+ * stored on disk). r is either the exact rotation R x of a new value or query
+ * (exact = true), or the estimate s_4 * y~ decoded from a stored code. The
+ * original vector follows r when hasOrig is set.
+ */
+typedef struct HnswTqValue
+{
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+	int16		marker;			/* HNSW_TQ_VALUE_MARKER */
+	uint16		pdim;
+	uint8		exact;
+	uint8		hasOrig;
+	uint16		unused;
+	float4		norm;			/* ||x|| */
+	float4		r[FLEXIBLE_ARRAY_MEMBER];
+}			HnswTqValue;
+
+#define HNSW_TQ_VALUE_SIZE(pdim)	(offsetof(HnswTqValue, r) + sizeof(float4) * (pdim))
+#define HnswTqValueOrig(v)	((Pointer) ((char *) (v) + HNSW_TQ_VALUE_SIZE((v)->pdim)))
+
+/* Re-rank payload for a quantized element, on HNSW_PAGE_RERANK pages */
+typedef struct HnswRerankTupleData
+{
+	uint8		type;			/* HNSW_RERANK_TUPLE_TYPE */
+	uint8		deleted;
+	uint16		unused;
+	float4		scale;			/* s_{4+k}(x) for NTQ */
+	char		data[FLEXIBLE_ARRAY_MEMBER];	/* packed k-bit codes or a Vector */
+}			HnswRerankTupleData;
+
+typedef HnswRerankTupleData * HnswRerankTuple;
+
+#define HnswIsRerankTuple(tup) ((tup)->type == HNSW_RERANK_TUPLE_TYPE)
+
 
 typedef struct HnswFastVisited
 {
@@ -549,6 +666,25 @@ void		HnswInitLockTranche(void);
 void		HnswCheckDim(int expected, const HnswTypeInfo * typeInfo, Oid collation, Datum value);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+
+/* Experimental TurboQuant navigation codes (hnswtq.c) */
+int			HnswGetQuantizer(Relation index);
+int			HnswGetRerank(Relation index);
+void		HnswTqInitTables(void);
+HnswTqState *HnswTqCreateState(Relation index, const HnswSupport * support, int dimensions);
+HnswTqState *HnswTqLoadState(Relation index);
+void		HnswTqSetMetaPage(HnswMetaPage metap, const HnswTqState * tq, Page page);
+Datum		HnswTqMakeValue(const HnswTqState * tq, Datum value, bool keepOrig);
+Pointer		HnswTqDecodeCode(const HnswTqCode * code);
+double		HnswTqValueDistance(const HnswSupport * support, Datum a, Datum b);
+double		HnswTqCodeDistance(const HnswTqState * tq, Datum q, const HnswTqCode * code);
+HnswTqCode *HnswTqEncode(const HnswTqState * tq, Datum value, HnswRerankTuple * rtup, Size *rtupSize);
+void		HnswTqAddRerankTuple(Relation index, HnswRerankTuple rtup, Size rtupSize, ItemPointer tid, bool building);
+void		HnswTqUpdateRerankMeta(Relation index, BlockNumber headBlkno, BlockNumber insertPage, ForkNumber forkNum, bool building);
+void		HnswTqLowerRerankInsertPage(Relation index, BlockNumber blkno);
+List	   *HnswTqRerank(Relation index, HnswSupport * support, HnswQuery * q, List *w);
+void		HnswTqRerankFast(Relation index, HnswSupport * support, HnswQuery * q, HnswFastResultCand *cands, int count);
+double		HnswTqCodeDistanceOptimistic(const HnswTqValue * qv, const HnswTqCode * code);
 
 /* Index access methods */
 IndexBuildResult *hnswbuild(Relation heap, Relation index, IndexInfo *indexInfo);
