@@ -185,6 +185,7 @@ The codec in `src/hnswtq.c` is a port of Ginger's. [tools/tq_check](tools/tq_che
 | `calico.optimistic_reads` | Session / User | `on` | Enables lock-free optimistic tuple reads during HNSW traversal for `vector_l2_ops`, `vector_ip_ops`, and `vector_cosine_ops`. |
 | `hnsw.enable_prefetch` | Session / User | `on` | Enables batched neighbor group prefetching (CPU prefetch + async read batching) during HNSW search. |
 | `hnsw.rerank_limit` | Session / User | `0` | For `quantizer = 'tq4'` indexes: re-score at most this many candidates with the 4+8 bit codes, the nearest by 4-bit distance; `0` re-scores all `ef_search` of them. A multiple of the query's `LIMIT` (for example 10 × k) keeps recall while bounding the cost at large `ef_search`. |
+| `hnsw.rerank_kernel` | Session / User | `auto` | The kernel that computes the 4+8 bit re-rank distances: `avx512`, `avx2` or `scalar`. `auto` uses the widest one the build has; a kernel it doesn't have is refused. The vector kernels sum in another order than the scalar loop, so distances agree with it to float rounding. |
 
 ## Cite pgvectorfast
 If you are using pgvectorfast, please cite our work as follows

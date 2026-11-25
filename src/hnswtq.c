@@ -12,7 +12,7 @@
 #include <math.h>
 #include <string.h>
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
 #endif
 
@@ -783,13 +783,185 @@ HnswTqDistance4(const HnswTqQuery * query, const uint8_t *codes, const HnswTqPoi
 	return negDot;
 }
 
+/* The kernel HnswTqDistance4k() uses for 4+8 bit codes (HnswTqKernel) */
+int			hnsw_tq_rerank_kernel = HNSW_TQ_KERNEL_AUTO;
+
+bool
+HnswTqKernelAvailable(int kernel)
+{
+	switch (kernel)
+	{
+		case HNSW_TQ_KERNEL_AUTO:
+		case HNSW_TQ_KERNEL_SCALAR:
+			return true;
+		case HNSW_TQ_KERNEL_AVX2:
+#if defined(__AVX2__) && defined(__FMA__)
+			return true;
+#else
+			return false;
+#endif
+		case HNSW_TQ_KERNEL_AVX512:
+#if defined(__AVX512F__)
+			return true;
+#else
+			return false;
+#endif
+	}
+	return false;
+}
+
+static inline float
+Finish4k(float sum, const HnswTqQuery * query, const HnswTqPointInfo * info, HnswTqMetric metric)
+{
+	const float score = sum * info->scale4k;
+
+	if (metric == HNSW_TQ_METRIC_L2)
+		return info->sqNorm + query->sqNorm - 2 * score;
+	return -score;
+}
+
+/*
+ * With 8 extra bits, dimension d's sub-code is the byte extra[d], and its
+ * centroid is hnsw_tq_centroids_4plus8[code & 7][extra[d]], negated when
+ * code & 8. The vector kernels gather those centroids (the table is 8 KB, so
+ * it stays in L1) and multiply them by the float query.
+ */
+#if defined(__AVX2__) || defined(__AVX512F__)
+/*
+ * The 4-bit codes of dimensions d .. d + 15 as 16 bytes in dimension order:
+ * the low nibble of each code byte is the even dimension, the high one the odd
+ */
+static inline __m128i
+Codes16(const uint8_t *codes, int d)
+{
+	const __m128i w = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *) (codes + d / 2)));
+
+	return _mm_or_si128(_mm_and_si128(w, _mm_set1_epi16(0x0F)),
+						_mm_slli_epi16(_mm_srli_epi16(w, 4), 8));
+}
+
+/* The scalar loop over the dimensions the vector loop left */
+static inline float
+Sum4p8Tail(const HnswTqQuery * query, const uint8_t *codes, const uint8_t *extra, int d)
+{
+	const float *centroids = &hnsw_tq_centroids_4plus8[0][0];
+	float		sum = 0.0f;
+
+	for (; d < query->dim; d++)
+	{
+		const uint8_t byte = codes[d / 2];
+		const uint8_t code = (d % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+		const float c = centroids[(code & 7) * 256 + extra[d]];
+
+		sum += query->qf[d] * ((code & 8) ? -c : c);
+	}
+	return sum;
+}
+#endif
+
+#if defined(__AVX512F__)
+/* One step of 16 dimensions: the signed centroids */
+static inline __m512
+Centroids4p8x16(const uint8_t *codes, const uint8_t *extra, int d)
+{
+	const __m512i c = _mm512_cvtepu8_epi32(Codes16(codes, d));
+	const __m512i sub = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *) (extra + d)));
+	const __m512i idx = _mm512_add_epi32(_mm512_slli_epi32(_mm512_and_si512(c, _mm512_set1_epi32(7)), 8), sub);
+	const __m512 v = _mm512_i32gather_ps(idx, &hnsw_tq_centroids_4plus8[0][0], 4);
+	/* code & 8 is the sign: bit 3 moved to bit 31 */
+	const __m512i sign = _mm512_slli_epi32(_mm512_and_si512(c, _mm512_set1_epi32(8)), 28);
+
+	return _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(v), sign));
+}
+
+static float
+Sum4p8Avx512(const HnswTqQuery * query, const uint8_t *codes, const uint8_t *extra)
+{
+	const float *qf = query->qf;
+	__m512		acc0 = _mm512_setzero_ps();
+	__m512		acc1 = _mm512_setzero_ps();
+	int			d = 0;
+
+	for (; d + 32 <= query->dim; d += 32)
+	{
+		acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(qf + d), Centroids4p8x16(codes, extra, d), acc0);
+		acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(qf + d + 16), Centroids4p8x16(codes, extra, d + 16), acc1);
+	}
+	for (; d + 16 <= query->dim; d += 16)
+		acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(qf + d), Centroids4p8x16(codes, extra, d), acc0);
+	return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1)) + Sum4p8Tail(query, codes, extra, d);
+}
+#endif
+
+#if defined(__AVX2__) && defined(__FMA__)
+/* One step of 8 dimensions, given their 8 code bytes and 8 sub-code bytes */
+static inline __m256
+Centroids4p8x8(__m128i codes8, __m128i subs8)
+{
+	const __m256i c = _mm256_cvtepu8_epi32(codes8);
+	const __m256i sub = _mm256_cvtepu8_epi32(subs8);
+	const __m256i idx = _mm256_add_epi32(_mm256_slli_epi32(_mm256_and_si256(c, _mm256_set1_epi32(7)), 8), sub);
+	const __m256 v = _mm256_i32gather_ps(&hnsw_tq_centroids_4plus8[0][0], idx, 4);
+	const __m256i sign = _mm256_slli_epi32(_mm256_and_si256(c, _mm256_set1_epi32(8)), 28);
+
+	return _mm256_castsi256_ps(_mm256_xor_si256(_mm256_castps_si256(v), sign));
+}
+
+static float
+Sum4p8Avx2(const HnswTqQuery * query, const uint8_t *codes, const uint8_t *extra)
+{
+	const float *qf = query->qf;
+	__m256		acc0 = _mm256_setzero_ps();
+	__m256		acc1 = _mm256_setzero_ps();
+	__m128		s;
+	int			d = 0;
+
+	for (; d + 16 <= query->dim; d += 16)
+	{
+		const __m128i c16 = Codes16(codes, d);
+		const __m128i e16 = _mm_loadu_si128((const __m128i *) (extra + d));
+
+		acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(qf + d), Centroids4p8x8(c16, e16), acc0);
+		acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(qf + d + 8),
+							   Centroids4p8x8(_mm_srli_si128(c16, 8), _mm_srli_si128(e16, 8)), acc1);
+	}
+	acc0 = _mm256_add_ps(acc0, acc1);
+	s = _mm_add_ps(_mm256_castps256_ps128(acc0), _mm256_extractf128_ps(acc0, 1));
+	s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+	s = _mm_add_ss(s, _mm_movehdup_ps(s));
+	return _mm_cvtss_f32(s) + Sum4p8Tail(query, codes, extra, d);
+}
+#endif
+
+/*
+ * 4+k bit distance estimate. For 8 extra bits, a vector kernel when one is
+ * built (hnsw_tq_rerank_kernel); otherwise HnswTqDistance4kScalar().
+ */
+float
+HnswTqDistance4k(const HnswTqQuery * query, const uint8_t *codes, const uint8_t *extra,
+				 int extraBits, const HnswTqPointInfo * info, HnswTqMetric metric)
+{
+	if (extraBits == 8)
+	{
+#if defined(__AVX512F__)
+		if (hnsw_tq_rerank_kernel == HNSW_TQ_KERNEL_AUTO || hnsw_tq_rerank_kernel == HNSW_TQ_KERNEL_AVX512)
+			return Finish4k(Sum4p8Avx512(query, codes, extra), query, info, metric);
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+		if (hnsw_tq_rerank_kernel != HNSW_TQ_KERNEL_SCALAR)
+			return Finish4k(Sum4p8Avx2(query, codes, extra), query, info, metric);
+#endif
+	}
+	return HnswTqDistance4kScalar(query, codes, extra, extraBits, info, metric);
+}
+
 /*
  * 4+k bit distance estimate, from the float query and the signed 4+k bit
  * centroids (TurboQuantScoringExtraPrecisionScalarReference)
  */
 float
-HnswTqDistance4k(const HnswTqQuery * query, const uint8_t *codes, const uint8_t *extra,
-				 int extraBits, const HnswTqPointInfo * info, HnswTqMetric metric)
+HnswTqDistance4kScalar(const HnswTqQuery * query, const uint8_t *codes, const uint8_t *extra,
+					   int extraBits, const HnswTqPointInfo * info, HnswTqMetric metric)
 {
 	const int	dim = query->dim;
 	const float *qf = query->qf;
