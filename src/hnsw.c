@@ -68,6 +68,7 @@ static const struct config_enum_entry hnsw_iterative_scan_options[] = {
 
 int			hnsw_ef_search;
 int			hnsw_rerank_limit = 0;
+bool		hnsw_scan_lock = true;
 int			hnsw_iterative_scan;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
@@ -141,6 +142,13 @@ HnswInit(void)
 							"0 re-ranks all ef_search candidates. Otherwise only the nearest this many by "
 							"4-bit distance are re-scored; set it to a multiple of the query's LIMIT.",
 							&hnsw_rerank_limit, 0, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/* For measurement only: off is unsafe if VACUUM can run on the index */
+	DefineCustomBoolVariable("hnsw.scan_lock", "Takes the scan lock that keeps VACUUM out of in-flight scans",
+							 "Each search takes a shared heavyweight page lock (HNSW_SCAN_LOCK), which VACUUM "
+							 "waits out before marking elements deleted. Off skips it, to measure its cost; "
+							 "a concurrent VACUUM could then free elements a scan is reading.",
+							 &hnsw_scan_lock, true, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("hnsw.rerank_kernel", "Kernel that re-ranks with 4+8 bit codes",
 							 "auto uses the widest one built: avx512, then avx2, then scalar.",
