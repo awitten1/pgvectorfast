@@ -20,6 +20,25 @@
 #endif
 
 /*
+ * The shared scan lock VACUUM waits out (HNSW_SCAN_LOCK). hnsw.scan_lock = off
+ * skips it, to measure what it costs: a page lock can't take the fast path, so
+ * every search takes and releases one entry of the shared lock table.
+ */
+static inline void
+ScanLock(Relation index)
+{
+	if (hnsw_scan_lock)
+		LockPage(index, HNSW_SCAN_LOCK, ShareLock);
+}
+
+static inline void
+ScanUnlock(Relation index)
+{
+	if (hnsw_scan_lock)
+		UnlockPage(index, HNSW_SCAN_LOCK, ShareLock);
+}
+
+/*
  * Algorithm 5 from paper
  */
 static List *
@@ -659,12 +678,12 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		 * Get a shared lock. This allows vacuum to ensure no in-flight scans
 		 * before marking tuples as deleted.
 		 */
-		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+		ScanLock(scan->indexRelation);
 
 		so->w = GetScanItems(scan, value);
 
 		/* Release shared lock */
-		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+		ScanUnlock(scan->indexRelation);
 
 		HnswPrefetchHeapResults(scan, so);
 		so->first = false;
@@ -694,11 +713,11 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 					break;
 
 				next_cnt = Min(HNSW_HEAP_PREFETCH_MAX, rem);
-				LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+				ScanLock(scan->indexRelation);
 				HnswLoadFastWindow(scan->indexRelation, &so->support,
 								   so->fast_cands, so->fast_idx, next_cnt, true,
 								   so->fast_win_tids, so->fast_win_len);
-				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+				ScanUnlock(scan->indexRelation);
 				so->fast_loaded_start = so->fast_idx;
 				so->fast_loaded_end = so->fast_idx + next_cnt;
 				so->heap_pref_count = 0;
@@ -734,13 +753,13 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 				expand = so->tuples < hnsw_max_scan_tuples &&
 					MemoryContextMemAllocated(so->tmpCtx, false) <= so->maxMemory;
 				if (expand)
-					LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+					ScanLock(scan->indexRelation);
 				HnswSearchIterativeBatch(&so->q,
 										 expand ? hnsw_ef_search : HNSW_ITER_DRAIN_BATCH,
 										 scan->indexRelation, &so->support,
 										 so->m, &so->v, &so->tuples, state, expand);
 				if (expand)
-					UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+					ScanUnlock(scan->indexRelation);
 
 				state->pref_start = 0;
 				state->pref_end = 0;
@@ -847,11 +866,11 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 					 * been deleted (and replaced), so when reading neighbors, the
 					 * element version must be checked.
 					 */
-					LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+					ScanLock(scan->indexRelation);
 
 					so->w = ResumeScanItems(scan);
 
-					UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+					ScanUnlock(scan->indexRelation);
 
 #if defined(HNSW_MEMORY)
 					ShowMemoryUsage(so);
