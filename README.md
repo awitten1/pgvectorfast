@@ -170,7 +170,7 @@ An HNSW index can store 4-bit [TurboQuant](https://arxiv.org/abs/2504.19874) cod
 CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (quantizer = 'tq4');
 ```
 
-- **What is stored:** each vector is randomly rotated and every coordinate is coded with 4 bits. A search walks the graph with 4-bit distances. It then re-scores the `ef_search` candidates it found with 8 more bits per coordinate, which sit on separate pages, and sorts them again. With `rerank = 'none'`, the 4-bit distances are final, which costs recall.
+- **What is stored:** each vector is randomly rotated and every coordinate is coded with 4 bits. A search walks the graph with 4-bit distances. It then re-scores the `ef_search` candidates it found with 8 more bits per coordinate, which sit on separate pages, and sorts them again. `hnsw.rerank_limit` re-scores only the nearest that many by 4-bit distance; the rest follow in 4-bit order. With `rerank = 'none'`, the 4-bit distances are final, which costs recall.
 - **Size:** at 384 dimensions, an element tuple drops from 1,616 to 288 bytes, and its re-rank bits take about 400 bytes more on the re-rank pages.
 - **The graph is built as usual,** with float distances, either by `CREATE INDEX` in memory or from a graph file (`hnsw.build_graph_file`, see [tools/pipnn_export](tools/pipnn_export/README.md)). A `CREATE INDEX` that outgrows `maintenance_work_mem` fails instead of continuing on disk.
 - **Supported:** `vector` columns with `vector_l2_ops`, `vector_ip_ops` or `vector_cosine_ops`, and dimensions that are an odd number of at most 31 times a power of 2 (for example 384 = 3 × 128, 768 or 1536).
@@ -184,6 +184,7 @@ The codec in `src/hnswtq.c` is a port of Ginger's. [tools/tq_check](tools/tq_che
 | --- | --- | --- | --- |
 | `calico.optimistic_reads` | Session / User | `on` | Enables lock-free optimistic tuple reads during HNSW traversal for `vector_l2_ops`, `vector_ip_ops`, and `vector_cosine_ops`. |
 | `hnsw.enable_prefetch` | Session / User | `on` | Enables batched neighbor group prefetching (CPU prefetch + async read batching) during HNSW search. |
+| `hnsw.rerank_limit` | Session / User | `0` | For `quantizer = 'tq4'` indexes: re-score at most this many candidates with the 4+8 bit codes, the nearest by 4-bit distance; `0` re-scores all `ef_search` of them. A multiple of the query's `LIMIT` (for example 10 × k) keeps recall while bounding the cost at large `ef_search`. |
 
 ## Cite pgvectorfast
 If you are using pgvectorfast, please cite our work as follows

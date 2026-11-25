@@ -182,6 +182,7 @@ typedef Pointer Item;
 
 /* Variables */
 extern int	hnsw_ef_search;
+extern int	hnsw_rerank_limit;
 extern int	hnsw_iterative_scan;
 extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;

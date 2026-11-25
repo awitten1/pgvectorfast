@@ -45,6 +45,7 @@ static const struct config_enum_entry hnsw_iterative_scan_options[] = {
 };
 
 int			hnsw_ef_search;
+int			hnsw_rerank_limit = 0;
 int			hnsw_iterative_scan;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
@@ -113,6 +114,11 @@ HnswInit(void)
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
 							HNSW_DEFAULT_EF_SEARCH, HNSW_MIN_EF_SEARCH, HNSW_MAX_EF_SEARCH, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.rerank_limit", "Maximum number of candidates a quantized search re-ranks",
+							"0 re-ranks all ef_search candidates. Otherwise only the nearest this many by "
+							"4-bit distance are re-scored; set it to a multiple of the query's LIMIT.",
+							&hnsw_rerank_limit, 0, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("hnsw.iterative_scan", "Sets the mode for iterative scans",
 							 NULL, &hnsw_iterative_scan,

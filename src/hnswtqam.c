@@ -622,7 +622,12 @@ CompareFastCands(const void *a, const void *b)
 
 /*
  * Re-score the candidates of a search with the 4+k bit codes, and sort them
- * nearest first again
+ * nearest first again.
+ *
+ * The candidates arrive nearest first by 4-bit distance. With hnsw.rerank_limit
+ * set, only the first hnsw_rerank_limit of them are re-scored and sorted; the
+ * rest stay after them in 4-bit order, so the scan still returns as many rows
+ * as before (Ginger likewise re-ranks only the top rerank_factor * k).
  */
 void
 HnswTqRerankCands(Relation index, HnswSupport * support, HnswQuery * q, HnswFastResultCand *cands, int count)
@@ -634,6 +639,13 @@ HnswTqRerankCands(Relation index, HnswSupport * support, HnswQuery * q, HnswFast
 
 	if (support->tq->extraBits == 0 || count <= 0 || qv == NULL)
 		return;
+
+#ifdef USE_ASSERT_CHECKING
+	for (int i = 1; i < count; i++)
+		Assert(cands[i - 1].distance <= cands[i].distance);
+#endif
+	if (hnsw_rerank_limit > 0 && count > hnsw_rerank_limit)
+		count = hnsw_rerank_limit;
 
 	/* First the re-rank TIDs, prefetching their pages; the elements are hot */
 	rtids = palloc_array_checked(ItemPointerData, count);
@@ -671,7 +683,8 @@ CompareSearchCandidatesFarthestFirst(const ListCell *a, const ListCell *b)
 
 /*
  * The same for the list a search returns (farthest first; the scan takes
- * from the end)
+ * from the end). Used only where the fast path can't run; hnsw.rerank_limit
+ * applies to the fast path (HnswTqRerankCands) only.
  */
 List *
 HnswTqRerankList(Relation index, HnswSupport * support, HnswQuery * q, List *w)
