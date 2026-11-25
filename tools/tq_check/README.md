@@ -11,9 +11,11 @@ from.
   4+k bit distances against Ginger's scalar reference scorers. It ends with
   recall@10 of 4-bit search reranked by 4+k bits on random data.
 - **`tq_selftest`** needs only the codec. It checks the dot-product kernel
-  (AVX2 when built with `-mavx2`) against a plain scalar one, and prints a
-  checksum of the codec's outputs on fixed inputs, which should be the same on
-  every architecture.
+  (AVX2 when built with `-mavx2`) against a plain scalar one, and the 4+8 bit
+  re-rank kernels (AVX2, and AVX-512 when the build has it) against the scalar
+  loop, within float rounding. It prints a checksum of the codec's outputs on
+  fixed inputs, from the scalar loop, which should be the same on every
+  architecture.
 - **`gen_codebooks`** writes `src/hnswtq_codebooks.h` from Ginger's codebook
   headers. Ginger computes several tables at compile time (the 4+k boundaries
   and the piecewise-cubic 4+6 and 4+8 bit codebooks), so they are generated

@@ -11,6 +11,7 @@
 #include "commands/vacuum.h"
 #include "fmgr.h"
 #include "hnsw.h"
+#include "hnswtq.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "storage/lwlock.h"
@@ -36,6 +37,27 @@ static relopt_enum_elt_def hnsw_rerank_options[] = {
 	{"ntq12", HNSW_RERANK_NTQ12},
 	{(const char *) NULL}
 };
+
+static const struct config_enum_entry hnsw_rerank_kernel_options[] = {
+	{"auto", HNSW_TQ_KERNEL_AUTO, false},
+	{"scalar", HNSW_TQ_KERNEL_SCALAR, false},
+	{"avx2", HNSW_TQ_KERNEL_AVX2, false},
+	{"avx512", HNSW_TQ_KERNEL_AVX512, false},
+	{NULL, 0, false}
+};
+
+/* Refuse a kernel this build of the extension doesn't have */
+static bool
+CheckRerankKernel(int *newval, void **extra, GucSource source)
+{
+	if (!HnswTqKernelAvailable(*newval))
+	{
+		GUC_check_errdetail("This build of the extension has no %s kernel.",
+							*newval == HNSW_TQ_KERNEL_AVX512 ? "AVX-512" : "AVX2");
+		return false;
+	}
+	return true;
+}
 
 static const struct config_enum_entry hnsw_iterative_scan_options[] = {
 	{"off", HNSW_ITERATIVE_SCAN_OFF, false},
@@ -119,6 +141,11 @@ HnswInit(void)
 							"0 re-ranks all ef_search candidates. Otherwise only the nearest this many by "
 							"4-bit distance are re-scored; set it to a multiple of the query's LIMIT.",
 							&hnsw_rerank_limit, 0, 0, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("hnsw.rerank_kernel", "Kernel that re-ranks with 4+8 bit codes",
+							 "auto uses the widest one built: avx512, then avx2, then scalar.",
+							 &hnsw_tq_rerank_kernel, HNSW_TQ_KERNEL_AUTO, hnsw_rerank_kernel_options,
+							 PGC_USERSET, 0, CheckRerankKernel, NULL, NULL);
 
 	DefineCustomEnumVariable("hnsw.iterative_scan", "Sets the mode for iterative scans",
 							 NULL, &hnsw_iterative_scan,

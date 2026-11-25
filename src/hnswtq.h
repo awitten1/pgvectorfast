@@ -112,5 +112,26 @@ extern float HnswTqDistance4(const HnswTqQuery * query, const uint8_t *codes,
 							 const HnswTqPointInfo * info, HnswTqMetric metric);
 extern float HnswTqDistance4k(const HnswTqQuery * query, const uint8_t *codes, const uint8_t *extra,
 							  int extraBits, const HnswTqPointInfo * info, HnswTqMetric metric);
+extern float HnswTqDistance4kScalar(const HnswTqQuery * query, const uint8_t *codes, const uint8_t *extra,
+									int extraBits, const HnswTqPointInfo * info, HnswTqMetric metric);
+
+/*
+ * The kernel HnswTqDistance4k() uses for 4+8 bit codes (the ntq12 rerank):
+ * AUTO picks the widest one built (AVX-512, else AVX2 with FMA, else scalar).
+ * Other extra-bit widths always take the scalar loop. The vector kernels sum
+ * in another order than the scalar one, so their results differ from it by
+ * float rounding (about 1e-6 of the terms); HnswTqDistance4kScalar() is the
+ * reference.
+ */
+typedef enum HnswTqKernel
+{
+	HNSW_TQ_KERNEL_AUTO,
+	HNSW_TQ_KERNEL_SCALAR,
+	HNSW_TQ_KERNEL_AVX2,
+	HNSW_TQ_KERNEL_AVX512
+}			HnswTqKernel;
+
+extern int	hnsw_tq_rerank_kernel;
+extern bool HnswTqKernelAvailable(int kernel);
 
 #endif							/* HNSWTQ_H */
